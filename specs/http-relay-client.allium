@@ -1,0 +1,201 @@
+-- allium: 3
+-- http-relay-client.allium
+
+-- Scope: the generic HTTP relay client that ships with the outbox framework.
+-- It delivers one message to one subscriber as a single HTTP request and
+-- reports whether the subscriber accepted it.
+-- Includes: HttpRelaySettings, HttpExchange, the success and failure outcomes
+--   reported back to the framework
+-- Excludes:
+--   - Outbox lifecycle: fan-out, retries, backoff, dead-lettering, message
+--     groups, time-to-live (outbox.allium)
+--   - Message resolution (the client receives the resolved payload, if any)
+--   - Credential storage and placeholder substitution in the endpoint and
+--     headers (platform feature)
+--   - Transport concerns: connection timeouts, TLS, redirects
+--   - The Case example under example/
+
+use "./outbox.allium" as outbox
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The system that receives messages for a subscription.
+external entity SubscriberEndpoint {}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+value HttpHeader {
+    name: String
+    content: String
+}
+
+-- Per-subscription settings, read from the subscription's client settings.
+value HttpRelaySettings {
+    endpoint: String
+    method: String?
+    headers: Set<HttpHeader>
+}
+
+value HttpResponse {
+    status_code: Integer
+    status: String
+    body: String
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract HttpEndpoint {
+    exchange: (endpoint: String, method: String, headers: Set<HttpHeader>, body: String) -> HttpResponse
+
+    @invariant OneRequestPerAttempt
+        -- The client makes exactly one request per relay attempt. It never
+        -- retries on its own. Retrying is the framework's decision.
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- The single request made for a relay attempt, and what came back.
+entity HttpExchange {
+    attempt: outbox/RelayAttempt
+    endpoint: String
+    method: String
+    headers: Set<HttpHeader>
+    body: String
+    status: sent | accepted | rejected | unanswered
+
+    -- Kept so that after-relay actions can inspect what the subscriber said.
+    response: HttpResponse when status = accepted | rejected
+
+    transitions status {
+        sent -> accepted
+        sent -> rejected
+        sent -> unanswered
+        terminal: accepted, rejected, unanswered
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The relay client name a subscription uses to select this client.
+    client_name: String = "TB_GenericHttpRelayClient"
+
+    default_method: String = "POST"
+
+    -- A response with a status code above this value means the subscriber
+    -- did not accept the message.
+    highest_accepted_status_code: Integer = 300
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule SendMessageOverHttp {
+    when: outbox/SendRequested(attempt)
+
+    requires: attempt.outbox.subscription.relay_client = config.client_name
+
+    -- http_settings reads the endpoint, method and headers from the
+    -- subscription's client settings.
+    let settings = http_settings(attempt.outbox.subscription.client_settings)
+
+    -- The resolved payload is preferred over the raw one. Text is sent
+    -- unchanged; any other structure is sent as its JSON encoding.
+    let body =
+        if attempt.resolved_payload != null: as_body_text(attempt.resolved_payload)
+        else: attempt.outbox.message.payload
+
+    ensures: HttpExchange.created(
+        attempt: attempt,
+        endpoint: settings.endpoint,
+        method: settings.method ?? config.default_method,
+        headers: settings.headers,
+        body: body,
+        status: sent
+    )
+}
+
+rule SubscriberAcceptsMessage {
+    when: HttpResponseReceived(exchange, response)
+
+    requires: exchange.status = sent
+    requires: response.status_code <= config.highest_accepted_status_code
+
+    ensures: exchange.status = accepted
+    ensures: exchange.response = response
+    ensures: outbox/RelaySucceeded(attempt: exchange.attempt)
+}
+
+rule SubscriberRejectsMessage {
+    when: HttpResponseReceived(exchange, response)
+
+    requires: exchange.status = sent
+    requires: response.status_code > config.highest_accepted_status_code
+
+    ensures: exchange.status = rejected
+    ensures: exchange.response = response
+
+    -- rejection_reason gives the status code and the response body, so
+    -- that whoever reviews the outbox can see why the subscriber refused.
+    ensures: outbox/RelayFailed(attempt: exchange.attempt, reason: rejection_reason(response))
+}
+
+rule SubscriberDoesNotAnswer {
+    when: HttpRequestFailed(exchange, reason)
+
+    requires: exchange.status = sent
+
+    ensures: exchange.status = unanswered
+    ensures: outbox/RelayFailed(attempt: exchange.attempt, reason: reason)
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface RelayRequests {
+    facing _: outbox/RelayClientImplementation
+
+    contracts:
+        fulfils outbox/RelayClient
+
+    @guarantee OutcomeAlwaysReported
+        -- Every send request ends in exactly one of RelaySucceeded or
+        -- RelayFailed. The client never reports success without a response
+        -- from the subscriber.
+
+    @guarantee AttemptIsTraceable
+        -- The attempt's log records the method, endpoint and body that were
+        -- sent and the status code that came back. On success it also
+        -- records the response body.
+}
+
+surface SubscriberDelivery {
+    facing _: SubscriberEndpoint
+
+    contracts:
+        demands HttpEndpoint
+
+    provides:
+        HttpResponseReceived(exchange, response)
+        HttpRequestFailed(exchange, reason)
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+open question "A response with status code exactly 300 is treated as accepted, and 301 and above as rejected. Was the intended boundary 'anything outside 2xx is a failure'?"
+open question "The endpoint setting is documented as required but nothing checks it. What should happen when a subscription has no endpoint: reject the configuration up front, or fail each attempt until the message is dead-lettered?"
+open question "When a message has no raw payload and no resolved payload, the request body is the JSON text null. Should an empty message be sent with an empty body, or not sent at all?"
