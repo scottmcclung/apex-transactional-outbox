@@ -334,6 +334,12 @@ entity SubscriptionOutbox {
 
     is_past_deadline: delivery_deadline != null and delivery_deadline <= now
 
+    -- A relay attempt for this outbox has started and its outcome is not
+    -- known yet. While this holds, the outbox cannot be skipped or expired,
+    -- so a delivery that is under way always gets to decide the outcome.
+    has_attempt_in_progress:
+        attempts.any(a => a.status in {resolving, sending} and a.run.status = running)
+
     is_due: is_pending and not is_past_deadline and not is_backing_off and not is_held_by_group
 
     has_configuration: subscription != null and message.definition != null
@@ -504,7 +510,7 @@ rule BeginRelayAttempt {
     -- An isolated outbox is only attempted as the first attempt of a run,
     -- and the run attempts nothing else after it.
     requires: not outbox.subscription.isolate_relay or run.attempts.count = 0
-    requires: not run.attempts.any(a => a.outbox.subscription.isolate_relay)
+    requires: not run.attempts.any(a => a.outbox.subscription != null and a.outbox.subscription.isolate_relay)
 
     ensures: outbox.relay_attempts = outbox.relay_attempts + 1
     ensures: outbox.last_attempt_at = now
@@ -574,6 +580,9 @@ rule RecordRelaySuccess {
 
     requires: attempt.status = sending
 
+    -- An outcome that arrives after its run has ended is not accepted.
+    requires: attempt.run.status = running
+
     let outbox = attempt.outbox
 
     ensures: attempt.status = succeeded
@@ -587,6 +596,7 @@ rule RecordRelayFailure {
     when: RelayFailed(attempt, reason)
 
     requires: attempt.status in {resolving, sending}
+    requires: attempt.run.status = running
 
     let outbox = attempt.outbox
 
@@ -603,6 +613,13 @@ rule RecordRelayFailure {
     ensures: outbox.next_attempt_at =
         attempt.requested_next_attempt_at
         ?? now + backoff_delay(outbox.effective_retry_backoff, outbox.relay_attempts)
+
+    -- The delivery deadline may have passed while this attempt was under
+    -- way. Expiry waited for the attempt, so it happens now.
+    ensures:
+        if outbox.is_past_deadline:
+            outbox.expired_at = now
+            outbox.retained_until = now + outbox.effective_retention
 
     @guidance
         -- Nothing else is needed to dead-letter the outbox. It is
@@ -707,6 +724,9 @@ rule OperatorSkipsOutbox {
 
     requires: not outbox.is_settled
 
+    -- The operator tries again once the attempt has finished.
+    requires: not outbox.has_attempt_in_progress
+
     -- The message is not relayed to this subscription. Later messages in
     -- its group are no longer held back by it.
     ensures: outbox.skipped_at = now
@@ -731,6 +751,10 @@ rule ExpireUndeliveredOutbox {
 
     -- Applies to pending and dead-lettered outboxes alike.
     requires: not outbox.is_settled
+
+    -- An outbox with an attempt under way expires when that attempt fails,
+    -- or is completed if it succeeds.
+    requires: not outbox.has_attempt_in_progress
 
     -- The system gives up on the message for this subscription. The record
     -- stays, marked as expired, until its retention period ends. Later
@@ -856,7 +880,8 @@ surface OutboxReview {
         OperatorDeadLettersOutbox(operator, outbox) when outbox.is_pending
         OperatorClearsManualDeadLetter(operator, outbox) when outbox.manual_dead_letter
         OperatorRaisesMaxAttempts(operator, outbox, max_attempts)
-        OperatorSkipsOutbox(operator, outbox) when not outbox.is_settled
+        OperatorSkipsOutbox(operator, outbox)
+            when not outbox.is_settled and not outbox.has_attempt_in_progress
         OperatorChangesRetentionEnd(operator, outbox, retained_until) when outbox.is_settled
         OperatorRequestsRelay(operator)
 
