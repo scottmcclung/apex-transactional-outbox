@@ -345,7 +345,7 @@ public class TB_OutboxRelayTests {
                 Next_Attempt_Timestamp__c,
                 Log__c
             FROM TB_Subscription_Outbox__c
-            ORDER BY Outbox_Message__r.Sequence_Number__c
+            ORDER BY Outbox_Message__r.Sequence_Number__c, Subscription__c
         ];
         System.assertEquals(2, subscriptionOutboxes.size());
 
@@ -420,7 +420,7 @@ public class TB_OutboxRelayTests {
                 Next_Attempt_Timestamp__c,
                 Log__c
             FROM TB_Subscription_Outbox__c
-            ORDER BY Outbox_Message__r.Sequence_Number__c
+            ORDER BY Outbox_Message__r.Sequence_Number__c, Subscription__c
         ];
         System.assertEquals(3, subscriptionOutboxes.size());
 
