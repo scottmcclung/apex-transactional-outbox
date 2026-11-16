@@ -215,11 +215,19 @@ rule SubscriberDoesNotAnswer {
 }
 
 ------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor HttpSubscriber {
+    identified_by: SubscriberEndpoint
+}
+
+------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
 
 surface RelayRequests {
-    facing _: outbox/RelayClientImplementation
+    facing _: outbox/InstalledRelayClient
 
     contracts:
         fulfils outbox/RelayClient
@@ -247,7 +255,7 @@ surface RelayRequests {
 }
 
 surface SubscriberDelivery {
-    facing _: SubscriberEndpoint
+    facing _: HttpSubscriber
 
     contracts:
         demands HttpEndpoint
