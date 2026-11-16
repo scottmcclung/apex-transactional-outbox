@@ -37,8 +37,12 @@ public class TB_TransactionOutboxTestUtils {
         return subscription;
     }
 
+    // One entry per call to TestClient.send, holding the resolved message the client was given.
+    @testVisible
+    static List<Object> sentMessages = new List<Object>();
     public class TestClient implements TB_IOutboxRelayClient {
         public void send(TB_OutboxRelayContext ctx) {
+            sentMessages.add(ctx.resolvedMessage);
             if (ctx.subscriptionConfig.containsKey('log')) {
                 ctx.log(ctx.subscriptionConfig.get('log'));
             }
@@ -58,6 +62,42 @@ public class TB_TransactionOutboxTestUtils {
                 result.put(msg.Id, 'resolved:' + msg.Message__c);
             }
             return result;
+        }
+    }
+
+    public class ThrowingResolver implements TB_IOutboxMessageResolver {
+        public Map<Id, Object> resolveMessages(TB_Outbox_Message__c[] messages) {
+            throw new TestException('Resolver Error');
+        }
+    }
+
+    // One entry per call to RecordingAction.execute, holding the argument as it was passed, null included.
+    @testVisible
+    static List<List<TB_OutboxRelayContext>> actionCalls = new List<List<TB_OutboxRelayContext>>();
+    // For each call, how many of the outboxes it was given were already stored with their attempt counted.
+    @testVisible
+    static List<Integer> actionSavedCounts = new List<Integer>();
+    public class RecordingAction implements TB_IAfterRelayAction {
+        public void execute(TB_OutboxRelayContext[] ctx) {
+            actionCalls.add(ctx);
+            Set<Id> outboxIds = new Set<Id>();
+            if (ctx != null) {
+                for (TB_OutboxRelayContext item : ctx) {
+                    outboxIds.add(item.outbox.Id);
+                }
+            }
+            actionSavedCounts.add(
+                [SELECT COUNT() FROM TB_Subscription_Outbox__c WHERE Id IN :outboxIds AND Relay_Attempts__c > 0]
+            );
+        }
+    }
+
+    @testVisible
+    static Integer throwingActionCalls = 0;
+    public class ThrowingAction implements TB_IAfterRelayAction {
+        public void execute(TB_OutboxRelayContext[] ctx) {
+            throwingActionCalls++;
+            throw new TestException('Action Error');
         }
     }
 

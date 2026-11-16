@@ -448,4 +448,284 @@ public class TB_OutboxRelayTests {
             'The third outbox should have been attempted once'
         );
     }
+
+    static TB_Outbox_Message__c newMessage(TB_Message_Definition__mdt msgDef) {
+        return new TB_Outbox_Message__c(Type__c = msgDef.DeveloperName, Message__c = 'Test Payload');
+    }
+
+    static List<TB_Subscription_Outbox__c> outboxesInOrder() {
+        return [
+            SELECT
+                Id,
+                Subscription__c,
+                Relay_Attempts__c,
+                Last_Error_Message__c,
+                Completed_Timestamp__c,
+                Next_Attempt_Timestamp__c
+            FROM TB_Subscription_Outbox__c
+            ORDER BY Outbox_Message__r.Sequence_Number__c, Subscription__c
+        ];
+    }
+
+    @isTest
+    static void testResolvedMessageReachesClient() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        msgDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.TestResolver';
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        Test.stopTest();
+
+        System.assertEquals(
+            new List<Object>{ 'resolved:Test Payload' },
+            TB_TransactionOutboxTestUtils.sentMessages,
+            'The client should be given what the resolver returned for the message'
+        );
+    }
+
+    @isTest
+    static void testClientGetsNullWhenNoResolverIsConfigured() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        Test.stopTest();
+
+        System.assertEquals(
+            new List<Object>{ null },
+            TB_TransactionOutboxTestUtils.sentMessages,
+            'The client should be called once with no resolved message'
+        );
+    }
+
+    @isTest
+    static void testResolverFailureIsRecordedAsFailedAttempt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        msgDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.ThrowingResolver';
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(1, outboxes.size());
+        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'A resolver failure should count as an attempt');
+        System.assert(
+            outboxes[0].Last_Error_Message__c.startsWith('Resolver Error'),
+            'The outbox should carry the resolver error, but has: ' + outboxes[0].Last_Error_Message__c
+        );
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox should not be completed');
+        System.assertEquals(
+            0,
+            TB_TransactionOutboxTestUtils.sentMessages.size(),
+            'The client should not be called for a message that failed to resolve'
+        );
+    }
+
+    @isTest
+    static void testResolverThatCannotBeBuiltIsRecordedAsFailedAttempt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        msgDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.NoSuchResolver';
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'A resolver that cannot be built should count as an attempt');
+        System.assert(
+            outboxes[0].Last_Error_Message__c.startsWith('TB_TransactionOutboxTestUtils.NoSuchResolver does not exist'),
+            'The outbox should carry the construction error, but has: ' + outboxes[0].Last_Error_Message__c
+        );
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'The client should not be called');
+    }
+
+    @isTest
+    static void testResolverFailureDoesNotAffectOtherMessageTypes() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt failingDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        failingDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.ThrowingResolver';
+        TB_Message_Subscription__mdt failingSub = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            failingDef,
+            'subscription1'
+        );
+        failingSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+
+        TB_Message_Definition__mdt workingDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        workingDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.TestResolver';
+        TB_Message_Subscription__mdt workingSub = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            workingDef,
+            'subscription2'
+        );
+        workingSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(failingDef), newMessage(workingDef) };
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(2, outboxes.size());
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The message that failed to resolve should not be completed');
+        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The other message type should be delivered');
+        System.assertEquals(
+            new List<Object>{ 'resolved:Test Payload' },
+            TB_TransactionOutboxTestUtils.sentMessages,
+            'Only the message that resolved should reach the client'
+        );
+    }
+
+    @isTest
+    static void testAfterRelayActionGetsEachSubscriptionsResults() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt deliveringSub = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        deliveringSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+        deliveringSub.After_Relay_Action__c = 'TB_TransactionOutboxTestUtils.RecordingAction';
+
+        TB_Message_Subscription__mdt failingSub = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription2'
+        );
+        failingSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+        failingSub.Config__c = '{"throwError":true}';
+        failingSub.After_Relay_Action__c = 'TB_TransactionOutboxTestUtils.RecordingAction';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(2, outboxes.size());
+        System.assertEquals(
+            2,
+            TB_TransactionOutboxTestUtils.actionCalls.size(),
+            'The action should be called once for each subscription'
+        );
+
+        Map<String, TB_OutboxRelayContext> resultBySubscription = new Map<String, TB_OutboxRelayContext>();
+        for (List<TB_OutboxRelayContext> call : TB_TransactionOutboxTestUtils.actionCalls) {
+            System.assertEquals(1, call.size(), 'Each call should hold only its own subscription\'s result');
+            resultBySubscription.put(call[0].outbox.Subscription__c, call[0]);
+        }
+
+        TB_OutboxRelayContext delivered = resultBySubscription.get('subscription1');
+        System.assertEquals(outboxes[0].Id, delivered.outbox.Id);
+        System.assertEquals('subscription1', delivered.subscription.DeveloperName);
+        System.assert(delivered.isComplete(), 'The delivered result should be complete');
+
+        TB_OutboxRelayContext failed = resultBySubscription.get('subscription2');
+        System.assertEquals(outboxes[1].Id, failed.outbox.Id);
+        System.assert(!failed.isComplete(), 'A failed attempt should also be passed to the action');
+        System.assert(failed.outbox.Last_Error_Message__c.startsWith('Test Error'));
+
+        System.assertEquals(
+            new List<Integer>{ 1, 1 },
+            TB_TransactionOutboxTestUtils.actionSavedCounts,
+            'The attempts should be stored before the action runs'
+        );
+    }
+
+    /**
+     * An action is built for every subscription of the message types in the run,
+     * so a subscription whose outbox was passed over still has its action called.
+     */
+    @isTest
+    static void testAfterRelayActionIsCalledWithNullWhenSubscriptionHadNoAttempt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt firstSub = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        firstSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+
+        TB_Message_Subscription__mdt isolatedSub = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription2'
+        );
+        isolatedSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+        isolatedSub.Isolate_Relay__c = true;
+        isolatedSub.After_Relay_Action__c = 'TB_TransactionOutboxTestUtils.RecordingAction';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(0, outboxes[1].Relay_Attempts__c, 'The isolated outbox should have been passed over');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.actionCalls.size(), 'The action should still be called');
+        System.assertEquals(null, TB_TransactionOutboxTestUtils.actionCalls[0], 'The action should be given null');
+    }
+
+    @isTest
+    static void testAfterRelayActionFailureIsSwallowed() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt throwingSub = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        throwingSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+        throwingSub.After_Relay_Action__c = 'TB_TransactionOutboxTestUtils.ThrowingAction';
+
+        TB_Message_Subscription__mdt recordingSub = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription2'
+        );
+        recordingSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+        recordingSub.After_Relay_Action__c = 'TB_TransactionOutboxTestUtils.RecordingAction';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        Test.stopTest();
+
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.throwingActionCalls, 'The failing action should have run');
+        System.assertEquals(
+            1,
+            TB_TransactionOutboxTestUtils.actionCalls.size(),
+            'The other subscription\'s action should still run'
+        );
+        for (TB_Subscription_Outbox__c outbox : outboxesInOrder()) {
+            System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'Both deliveries should stay stored');
+        }
+    }
 }
