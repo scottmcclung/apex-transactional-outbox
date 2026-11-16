@@ -177,6 +177,12 @@ contract RelayClient {
         -- and memory. A client that looks up records before sending counts
         -- those queries here.
 
+    @invariant CostMustFitOneRun
+        -- validate_settings rejects settings under which one send would
+        -- need more than a whole relay run has, such as a wait for the
+        -- subscriber longer than a run may spend on outbound calls. Such a
+        -- send could never start.
+
     @invariant MayPauseItsSubscription
         -- During a send the client may ask the framework to stop sending to
         -- its subscription until a given time, for example when the
@@ -478,7 +484,9 @@ entity RelayRun {
 entity RelayAttempt {
     run: RelayRun
     outbox: SubscriptionOutbox
-    status: resolving | sending | succeeded | failed
+    -- abandoned: the run reached one of its own limits during the attempt.
+    -- That is the run's doing and says nothing about the subscriber.
+    status: resolving | sending | succeeded | failed | abandoned
 
     resolved_payload: ResolvedPayload?
 
@@ -494,7 +502,9 @@ entity RelayAttempt {
         resolving -> failed
         sending -> succeeded
         sending -> failed
-        terminal: succeeded, failed
+        resolving -> abandoned
+        sending -> abandoned
+        terminal: succeeded, failed, abandoned
     }
 }
 
@@ -618,6 +628,9 @@ rule BeginRelayAttempt {
     -- An outbox that is passed over for lack of room is not attempted, so
     -- it is not charged an attempt. It waits for the next run.
     requires: has_budget_for(run, cost_of_send(outbox.subscription))
+
+    -- Once a run has reached one of its limits it starts nothing more.
+    requires: not run.attempts.any(a => a.status = abandoned)
 
     -- An isolated outbox is only attempted as the first attempt of a run,
     -- and the run attempts nothing else after it.
@@ -744,6 +757,31 @@ rule RecordRelayFailure {
     @guidance
         -- Nothing else is needed to dead-letter the outbox. It is
         -- dead-lettered as soon as its attempts reach its maximum.
+}
+
+rule AbandonAttemptAtRunLimit {
+    when: RunLimitReached(attempt, reason)
+
+    requires: attempt.status in {resolving, sending}
+    requires: attempt.run.is_running
+
+    let outbox = attempt.outbox
+
+    -- The budget check is meant to prevent this. It happens when a relay
+    -- client used more than it declared. The outbox is put back as it was:
+    -- the attempt is not counted, no error is recorded against it and no
+    -- wait is added. The run starts nothing more, and the next run takes
+    -- the outbox up again.
+    ensures: attempt.status = abandoned
+    ensures: outbox.relay_attempts = outbox.relay_attempts - 1
+
+    -- Reported so that the wrong declaration gets noticed.
+    ensures: ErrorReported(subscription: outbox.subscription, reason: reason)
+
+    @guidance
+        -- If the request had already gone out when the limit was reached,
+        -- the subscriber may have received the message. The next run sends
+        -- it again with the same idempotency key.
 }
 
 -- Reporting to the log adapter
@@ -1018,6 +1056,7 @@ surface RelaySchedule {
     provides:
         RelaySweepDue()
         RelayRunEnded(run)
+        RunLimitReached(attempt, reason)
 }
 
 surface OutboxReview {
