@@ -192,7 +192,9 @@ contract RelayClient {
     @invariant MayPauseItsSubscription
         -- During a send the client may ask the framework to pause its
         -- subscription, for example when the subscriber says it is being
-        -- sent too much. How long the pause lasts comes from the
+        -- sent too much. The client decides this from what one response
+        -- says. The framework does not pause a subscription by itself from
+        -- a pattern of failures. How long the pause lasts comes from the
         -- subscription's pause backoff, not from the client. While a
         -- subscription is paused or stopped its outboxes are left alone and
         -- are not charged an attempt.
@@ -279,7 +281,15 @@ contract LogAdapter {
 
     @invariant ErrorsOutsideAttemptsAreReported
         -- The framework also reports failures that belong to a subscription
-        -- but not to one attempt, such as its after-relay action failing.
+        -- but not to one attempt: its after-relay action failing, a relay
+        -- run reaching one of its limits during an attempt, and sending to
+        -- the subscription being stopped.
+
+    @invariant AlsoTheNotificationChannel
+        -- Logging and notifying happen at the same point, so they share
+        -- this one interface. The framework sends no notifications of its
+        -- own. An organisation that wants someone told about an error has
+        -- its adapter do that.
 
     @invariant OnlyWhereItIsNamed
         -- An adapter receives reports for the subscriptions that name it.
@@ -1308,7 +1318,8 @@ surface LoggingIntegration {
     @guarantee WorksWithoutAnAdapter
         -- A subscription that names no adapter is relayed as normal. The
         -- only record is then what each of its outboxes holds about its
-        -- latest attempt.
+        -- latest attempt. Errors for it are not reported to anyone, so a
+        -- stopped subscription is only found by looking.
 
     @guarantee FallbackOnTheApplication
         -- An application can name a fallback adapter. It receives reports
