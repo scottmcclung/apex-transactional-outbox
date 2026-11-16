@@ -359,6 +359,28 @@ entity SubscriptionOutbox {
     -- changes to the subscription do not affect it.
     max_attempts: Integer
     relay_attempts: Integer
+
+    -- pending: waiting to be delivered, or between attempts.
+    -- dead_lettered: set aside. Nothing is attempted until an operator acts
+    --   or the delivery deadline passes.
+    -- completed: the relay client reported a delivery.
+    -- skipped: an operator decided it will not be delivered.
+    -- expired: the delivery deadline passed before it was delivered.
+    status: pending | dead_lettered | completed | skipped | expired
+
+    transitions status {
+        pending -> completed
+        pending -> dead_lettered
+        dead_lettered -> pending
+        pending -> skipped
+        dead_lettered -> skipped
+        pending -> expired
+        dead_lettered -> expired
+        terminal: completed, skipped, expired
+    }
+
+    -- True when an operator set the outbox aside by hand. An outbox is also
+    -- dead-lettered, without this, when its attempts reach its maximum.
     manual_dead_letter: Boolean
 
     -- A copy of the subscription's backoff, taken when the outbox is
@@ -368,18 +390,14 @@ entity SubscriptionOutbox {
 
     last_attempt_at: Timestamp?
     next_attempt_at: Timestamp?
-    completed_at: Timestamp?
 
-    -- Set when an operator decides the message will not be delivered to
-    -- this subscription. Kept apart from completed_at so the record never
-    -- reads as a delivery that did not happen.
-    skipped_at: Timestamp?
-    skipped_by: User?
-
-    -- Set when the time-to-live passes before the message is delivered.
-    -- Kept apart from skipped_at so a decision the system made is never
-    -- mistaken for one a person made.
-    expired_at: Timestamp?
+    -- Each way of settling keeps its own record, and only in that state.
+    -- A skip is never read as a delivery, and a decision the system made is
+    -- never mistaken for one a person made.
+    completed_at: Timestamp when status = completed
+    skipped_at: Timestamp when status = skipped
+    skipped_by: User when status = skipped
+    expired_at: Timestamp when status = expired
 
     -- The reason the most recent attempt failed.
     last_error: String?
@@ -401,23 +419,19 @@ entity SubscriptionOutbox {
     -- is used in place of the subscription's.
     retention_override: Duration?
 
-    -- The end of the retention period, set when the outbox is settled. The
-    -- record is removed after this. A later change to the subscription's
-    -- retention does not move it. Only an operator can change it.
-    retained_until: Timestamp?
+    -- The end of the retention period. It exists only once the outbox is
+    -- settled, and the record is removed after it. A later change to the
+    -- subscription's retention does not move it. Only an operator can
+    -- change it.
+    retained_until: Timestamp? when status = completed | skipped | expired
 
     attempts: RelayAttempt with outbox = this
     group_siblings: SubscriptionOutbox with application = this.application and message.group_id = this.message.group_id
 
-    is_completed: completed_at != null
-    is_skipped: skipped_at != null
-    is_expired: expired_at != null
-
     -- Nothing more will be done for this outbox.
-    is_settled: is_completed or is_skipped or is_expired
+    is_settled: status in {completed, skipped, expired}
 
-    is_dead_lettered: not is_settled and (relay_attempts >= max_attempts or manual_dead_letter)
-    is_pending: not is_settled and not is_dead_lettered
+    is_pending: status = pending
     is_backing_off: next_attempt_at != null and next_attempt_at > now
 
     -- An earlier message in the same group is not settled yet. Whether
@@ -464,22 +478,12 @@ entity SubscriptionOutbox {
         relay_attempts >= 0
     }
 
-    invariant SettledInExactlyOneWay {
-        not (is_completed and is_skipped)
-        and not (is_completed and is_expired)
-        and not (is_skipped and is_expired)
+    invariant DeadLetteredForAReason {
+        status = dead_lettered implies (relay_attempts >= max_attempts or manual_dead_letter)
     }
 
-    invariant SkipNamesWhoDidIt {
-        is_skipped implies skipped_by != null
-    }
-
-    invariant OnlyASkipNamesAPerson {
-        skipped_by != null implies is_skipped
-    }
-
-    invariant RetentionStartsAtSettlement {
-        retained_until != null implies is_settled
+    invariant PendingHasAttemptsLeft {
+        status = pending implies (relay_attempts < max_attempts and not manual_dead_letter)
     }
 }
 
@@ -598,6 +602,7 @@ rule PublishMessage {
                 max_attempts: subscription.max_attempts,
                 retry_backoff: subscription.retry_backoff,
                 relay_attempts: 0,
+                status: pending,
                 manual_dead_letter: false,
                 delivery_deadline: now + subscription.ttl,
                 retention: subscription.retention
@@ -690,6 +695,7 @@ rule FailAttemptWithoutConfiguration {
     when: RelayTurnOffered(run, outbox)
 
     requires: run.status = running
+    requires: outbox.status = pending
     requires: outbox.is_due
     requires: not outbox.has_configuration
     requires: run.attempts.count < config.relay_run_size
@@ -705,6 +711,9 @@ rule FailAttemptWithoutConfiguration {
     ensures: RelayAttempt.created(run: run, outbox: outbox, status: failed)
     ensures: outbox.next_attempt_at =
         now + backoff_delay(outbox.effective_retry_backoff, outbox.relay_attempts)
+    ensures:
+        if outbox.relay_attempts >= outbox.max_attempts:
+            outbox.status = dead_lettered
 }
 
 rule RequestResolution {
@@ -749,7 +758,10 @@ rule RecordRelaySuccess {
 
     let outbox = attempt.outbox
 
+    requires: outbox.status = pending
+
     ensures: attempt.status = succeeded
+    ensures: outbox.status = completed
     ensures: outbox.completed_at = now
     ensures: outbox.retention_override = attempt.requested_retention ?? outbox.retention_override
     ensures: outbox.retained_until =
@@ -763,6 +775,8 @@ rule RecordRelayFailure {
     requires: attempt.run.is_running
 
     let outbox = attempt.outbox
+
+    requires: outbox.status = pending
 
     ensures: attempt.status = failed
     ensures: outbox.last_error = reason
@@ -779,15 +793,16 @@ rule RecordRelayFailure {
         ?? now + backoff_delay(outbox.effective_retry_backoff, outbox.relay_attempts)
 
     -- The delivery deadline may have passed while this attempt was under
-    -- way. Expiry waited for the attempt, so it happens now.
+    -- way. Expiry waited for the attempt, so it happens now. Otherwise the
+    -- outbox is dead-lettered once its attempts reach its maximum, and
+    -- stays pending if it has attempts left.
     ensures:
         if outbox.is_past_deadline:
+            outbox.status = expired
             outbox.expired_at = now
             outbox.retained_until = now + outbox.effective_retention
-
-    @guidance
-        -- Nothing else is needed to dead-letter the outbox. It is
-        -- dead-lettered as soon as its attempts reach its maximum.
+        else if outbox.relay_attempts >= outbox.max_attempts:
+            outbox.status = dead_lettered
 }
 
 -- Pausing and stopping a subscription
@@ -894,6 +909,8 @@ rule AbandonAttemptAtRunLimit {
 
     let outbox = attempt.outbox
 
+    requires: outbox.status = pending
+
     -- The budget check is meant to prevent this. It happens when a relay
     -- client used more than it declared. The outbox is put back as it was:
     -- the attempt is not counted, no error is recorded against it and no
@@ -901,6 +918,14 @@ rule AbandonAttemptAtRunLimit {
     -- the outbox up again.
     ensures: attempt.status = abandoned
     ensures: outbox.relay_attempts = outbox.relay_attempts - 1
+
+    -- The delivery deadline may have passed while this attempt was under
+    -- way. Expiry waited for the attempt, so it happens now.
+    ensures:
+        if outbox.is_past_deadline:
+            outbox.status = expired
+            outbox.expired_at = now
+            outbox.retained_until = now + outbox.effective_retention
 
     -- Reported so that the wrong declaration gets noticed.
     ensures: ErrorReported(subscription: outbox.subscription, reason: reason)
@@ -980,19 +1005,59 @@ rule FinishRelayRun {
 
 rule OperatorDeadLettersOutbox {
     when: OperatorDeadLettersOutbox(operator, outbox)
-    requires: outbox.is_pending
+
+    requires: outbox.status = pending
+
+    -- Once the delivery deadline has passed, the outbox expires. Nothing
+    -- else is done to it.
+    requires: not outbox.is_past_deadline
+
+    -- The operator tries again once the attempt has finished.
+    requires: not outbox.has_attempt_in_progress
+
+    ensures: outbox.status = dead_lettered
     ensures: outbox.manual_dead_letter = true
 }
 
 rule OperatorClearsManualDeadLetter {
     when: OperatorClearsManualDeadLetter(operator, outbox)
+
+    requires: outbox.status = dead_lettered
     requires: outbox.manual_dead_letter
+    requires: not outbox.is_past_deadline
+
+    -- The outbox becomes pending again only if it still has attempts left.
+    -- One that has also used up its attempts stays dead-lettered.
     ensures: outbox.manual_dead_letter = false
+    ensures:
+        if outbox.relay_attempts < outbox.max_attempts:
+            outbox.status = pending
 }
 
 rule OperatorRaisesMaxAttempts {
     when: OperatorRaisesMaxAttempts(operator, outbox, max_attempts)
+
+    requires: outbox.status = dead_lettered
     requires: max_attempts > outbox.relay_attempts
+    requires: not outbox.is_past_deadline
+
+    -- The outbox becomes pending again unless an operator also set it
+    -- aside by hand.
+    ensures: outbox.max_attempts = max_attempts
+    ensures:
+        if not outbox.manual_dead_letter:
+            outbox.status = pending
+}
+
+rule OperatorRaisesMaxAttemptsInAdvance {
+    when: OperatorRaisesMaxAttemptsInAdvance(operator, outbox, max_attempts)
+
+    -- For an outbox that is still being attempted and should be given more
+    -- tries before it runs out.
+    requires: outbox.status = pending
+    requires: max_attempts > outbox.max_attempts
+    requires: not outbox.is_past_deadline
+
     ensures: outbox.max_attempts = max_attempts
 }
 
@@ -1002,28 +1067,47 @@ rule OperatorReattemptsDeadLetters {
     -- Every dead-lettered outbox for the subscription is made pending
     -- again in one step. Each gets a fresh allowance of attempts, the same
     -- size as the subscription's maximum, and any wait is cleared.
-    ensures:
-        for outbox in subscription.outboxes where is_dead_lettered:
-            outbox.max_attempts = outbox.relay_attempts + subscription.max_attempts
-            outbox.manual_dead_letter = false
-            outbox.next_attempt_at = null
-    ensures: RelayRequested()
+    for outbox in subscription.outboxes:
+        requires: outbox.status = dead_lettered
+        requires: not outbox.is_past_deadline
+        ensures: outbox.status = pending
+        ensures: outbox.max_attempts = outbox.relay_attempts + subscription.max_attempts
+        ensures: outbox.manual_dead_letter = false
+        ensures: outbox.next_attempt_at = null
+        ensures: RelayRequested()
 
     @guidance
         -- An outbox past its delivery deadline has already expired and is
         -- not dead-lettered any more, so it is not picked up.
 }
 
-rule OperatorSkipsOutbox {
+-- Skipping is written as two rules, one for each state an outbox can be
+-- skipped from, so that each move between states is stated outright.
+
+rule OperatorSkipsPendingOutbox {
     when: OperatorSkipsOutbox(operator, outbox)
 
-    requires: not outbox.is_settled
+    requires: outbox.status = pending
+    requires: not outbox.is_past_deadline
 
     -- The operator tries again once the attempt has finished.
     requires: not outbox.has_attempt_in_progress
 
     -- The message is not relayed to this subscription. Later messages in
     -- its group are no longer held back by it.
+    ensures: outbox.status = skipped
+    ensures: outbox.skipped_at = now
+    ensures: outbox.skipped_by = operator
+    ensures: outbox.retained_until = now + outbox.effective_retention
+}
+
+rule OperatorSkipsDeadLetteredOutbox {
+    when: OperatorSkipsOutbox(operator, outbox)
+
+    requires: outbox.status = dead_lettered
+    requires: not outbox.is_past_deadline
+
+    ensures: outbox.status = skipped
     ensures: outbox.skipped_at = now
     ensures: outbox.skipped_by = operator
     ensures: outbox.retained_until = now + outbox.effective_retention
@@ -1034,18 +1118,27 @@ rule OperatorChangesRetentionEnd {
 
     -- Only a settled outbox has a retention end. An operator who wants bad
     -- records gone skips them and then brings this date forward.
-    requires: outbox.is_settled
+    requires: outbox.status in {completed, skipped, expired}
 
     ensures: outbox.retained_until = retained_until
 }
 
 -- Cleanup
 
-rule ExpireUndeliveredOutbox {
+-- Expiry applies to pending and dead-lettered outboxes alike. It is written
+-- as two rules, one for each state, so that each move is stated outright.
+--
+-- What happens at the delivery deadline:
+--   - An attempt already under way is allowed to finish. A success
+--     completes the outbox. A failure, or the attempt being abandoned,
+--     expires it.
+--   - Otherwise the outbox expires. No new attempt starts and no operator
+--     action applies once the deadline has passed.
+
+rule ExpirePendingOutbox {
     when: outbox: SubscriptionOutbox.delivery_deadline <= now
 
-    -- Applies to pending and dead-lettered outboxes alike.
-    requires: not outbox.is_settled
+    requires: outbox.status = pending
 
     -- An outbox with an attempt under way expires when that attempt fails,
     -- or is completed if it succeeds.
@@ -1054,6 +1147,17 @@ rule ExpireUndeliveredOutbox {
     -- The system gives up on the message for this subscription. The record
     -- stays, marked as expired, until its retention period ends. Later
     -- messages in its group are no longer held back.
+    ensures: outbox.status = expired
+    ensures: outbox.expired_at = now
+    ensures: outbox.retained_until = now + outbox.effective_retention
+}
+
+rule ExpireDeadLetteredOutbox {
+    when: outbox: SubscriptionOutbox.delivery_deadline <= now
+
+    requires: outbox.status = dead_lettered
+
+    ensures: outbox.status = expired
     ensures: outbox.expired_at = now
     ensures: outbox.retained_until = now + outbox.effective_retention
 }
@@ -1063,7 +1167,7 @@ rule RemoveOutboxAfterRetention {
 
     -- Retention only starts once an outbox is settled, so an undelivered
     -- outbox is never removed by cleanup.
-    requires: outbox.is_settled
+    requires: outbox.status in {completed, skipped, expired}
 
     ensures: not exists outbox
 
@@ -1092,7 +1196,7 @@ invariant OneRelayRunAtATime {
 
 invariant CompletedOnlyAfterSuccess {
     for outbox in SubscriptionOutboxes:
-        outbox.is_completed implies outbox.attempts.any(a => a.status = succeeded)
+        outbox.status = completed implies outbox.attempts.any(a => a.status = succeeded)
 }
 
 invariant IdempotencyKeysAreUnique {
@@ -1221,27 +1325,32 @@ surface OutboxReview {
         outbox.message.group_id
         outbox.relay_attempts
         outbox.max_attempts
-        outbox.is_completed
-        outbox.is_dead_lettered
+        outbox.status
+        outbox.manual_dead_letter
         outbox.last_attempt_at
         outbox.next_attempt_at
-        outbox.completed_at
-        outbox.skipped_at
-        outbox.skipped_by
-        outbox.expired_at
-        outbox.retained_until
+        outbox.completed_at when outbox.status = completed
+        outbox.skipped_at when outbox.status = skipped
+        outbox.skipped_by when outbox.status = skipped
+        outbox.expired_at when outbox.status = expired
+        outbox.retained_until when outbox.status in {completed, skipped, expired}
         outbox.last_error
         outbox.log
         outbox.delivery_deadline
 
     provides:
-        OperatorDeadLettersOutbox(operator, outbox) when outbox.is_pending
-        OperatorClearsManualDeadLetter(operator, outbox) when outbox.manual_dead_letter
-        OperatorRaisesMaxAttempts(operator, outbox, max_attempts)
-        OperatorSkipsOutbox(operator, outbox)
-            when not outbox.is_settled and not outbox.has_attempt_in_progress
-        OperatorChangesRetentionEnd(operator, outbox, retained_until) when outbox.is_settled
+        OperatorDeadLettersOutbox(operator, outbox) when outbox.status = pending
+        OperatorClearsManualDeadLetter(operator, outbox) when outbox.status = dead_lettered
+        OperatorRaisesMaxAttempts(operator, outbox, max_attempts) when outbox.status = dead_lettered
+        OperatorRaisesMaxAttemptsInAdvance(operator, outbox, max_attempts) when outbox.status = pending
+        OperatorSkipsOutbox(operator, outbox) when outbox.status in {pending, dead_lettered}
+        OperatorChangesRetentionEnd(operator, outbox, retained_until)
+            when outbox.status in {completed, skipped, expired}
         OperatorRequestsRelay(operator)
+
+    timeout:
+        ExpirePendingOutbox
+        ExpireDeadLetteredOutbox
 
     @guarantee OversizedTextNeverBlocksTheOutcome
         -- An error or log too long to store is shortened. It never prevents
