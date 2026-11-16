@@ -6,7 +6,7 @@
 -- subscriber, retrying on failure, until it is delivered or set aside.
 -- Includes: OutboxMessage, SubscriptionOutbox, RelayRun, RelayAttempt, fan-out,
 --   relay, retry backoff, dead-lettering, message groups, isolated relay,
---   after-relay actions, time-to-live cleanup, the contracts for relay clients,
+--   after-relay actions, the log adapter, time-to-live cleanup, the contracts for relay clients,
 --   message resolvers and after-relay actions
 -- Excludes:
 --   - The bundled HTTP relay client (http-relay-client.allium)
@@ -37,6 +37,10 @@ external entity RelayClientImplementation {}
 external entity MessageResolverImplementation {}
 external entity AfterRelayActionImplementation {}
 
+-- Written by the team that installs the framework. It passes what the
+-- framework reports to whatever logging that organisation uses.
+external entity LogAdapterImplementation {}
+
 -- Opaque data whose shape belongs to the pluggable code that produces or
 -- reads it.
 external entity ResolvedPayload {}
@@ -53,6 +57,11 @@ external entity Application {
     -- Whether an undelivered message on one subscription holds back the
     -- application's other subscriptions for that message group. Required.
     group_order: GroupOrder
+
+    -- Whether the application names a fallback log adapter. Optional. It
+    -- is used for an outbox whose subscription is missing, because there
+    -- is then no subscription to say where reports go.
+    has_log_adapter: Boolean
 }
 
 external entity MessageDefinition {
@@ -105,6 +114,13 @@ external entity Subscription {
 
     isolate_relay: Boolean
     has_after_relay_action: Boolean
+
+    -- Whether the subscription names a log adapter. Optional. Each
+    -- subscription chooses its own, so logging can differ from one
+    -- endpoint to another.
+    has_log_adapter: Boolean
+
+    outboxes: SubscriptionOutbox with subscription = this
 }
 
 ------------------------------------------------------------
@@ -168,6 +184,33 @@ contract AfterRelayAction {
     @invariant NoDeliveryGuarantee
         -- An action that fails is not retried and does not change whether a
         -- message counts as delivered.
+}
+
+contract LogAdapter {
+    record_attempt: (attempt: RelayAttempt) -> Boolean
+    record_error: (reason: String) -> Boolean
+
+    @invariant EveryAttemptIsReported
+        -- The framework reports every relay attempt once its outcome is
+        -- known, whether it succeeded or failed. The report carries what
+        -- was logged during the attempt, the result the relay client
+        -- attached, such as the subscriber's response, and the reason for
+        -- any failure. The adapter decides what to keep, so an organisation
+        -- can log successes, failures or both as its needs require.
+
+    @invariant ErrorsOutsideAttemptsAreReported
+        -- The framework also reports failures that belong to a subscription
+        -- but not to one attempt, such as its after-relay action failing.
+
+    @invariant OnlyWhereItIsNamed
+        -- An adapter receives reports for the subscriptions that name it.
+        -- An adapter named on an application receives reports for that
+        -- application's outboxes whose subscription is missing. It
+        -- receives nothing else.
+
+    @invariant NeverAffectsDelivery
+        -- An adapter that fails does not change the outcome of an attempt,
+        -- stop the relay run, or prevent outcomes being recorded.
 }
 
 ------------------------------------------------------------
@@ -241,7 +284,12 @@ entity SubscriptionOutbox {
     -- mistaken for one a person made.
     expired_at: Timestamp?
 
+    -- The reason the most recent attempt failed.
     last_error: String?
+
+    -- What was logged during the most recent attempt only. It is cleared
+    -- when a new attempt starts. The full history of attempts is whatever
+    -- the log adapter recorded.
     log: String?
 
     -- The time-to-live deadline. An outbox still undelivered at this time
@@ -461,6 +509,7 @@ rule BeginRelayAttempt {
     ensures: outbox.relay_attempts = outbox.relay_attempts + 1
     ensures: outbox.last_attempt_at = now
     ensures: outbox.next_attempt_at = null
+    ensures: outbox.log = null
     ensures:
         if outbox.message.definition.has_resolver:
             RelayAttempt.created(run: run, outbox: outbox, status: resolving)
@@ -481,6 +530,7 @@ rule FailAttemptWithoutConfiguration {
     -- restored. Nothing is sent, and the run carries on with other outboxes.
     ensures: outbox.relay_attempts = outbox.relay_attempts + 1
     ensures: outbox.last_attempt_at = now
+    ensures: outbox.log = null
     ensures: outbox.last_error = missing_configuration_reason(outbox)
     ensures: RelayAttempt.created(run: run, outbox: outbox, status: failed)
     ensures: outbox.next_attempt_at =
@@ -559,6 +609,39 @@ rule RecordRelayFailure {
         -- dead-lettered as soon as its attempts reach its maximum.
 }
 
+-- Reporting to the log adapter
+
+rule ReportSuccessfulAttempt {
+    when: attempt: RelayAttempt.status becomes succeeded
+    requires: attempt.outbox.subscription != null and attempt.outbox.subscription.has_log_adapter
+    ensures: AttemptReported(attempt: attempt)
+}
+
+rule ReportFailedAttempt {
+    -- Covers an attempt that failed while sending or resolving, and one
+    -- that failed at once because its configuration was missing.
+    when: attempt: RelayAttempt.status becomes failed
+
+    -- An attempt whose subscription is missing is reported to the
+    -- application's fallback adapter, when the application names one.
+    -- Otherwise its only record is on the outbox.
+    requires:
+        (attempt.outbox.subscription != null and attempt.outbox.subscription.has_log_adapter)
+        or (attempt.outbox.subscription = null and attempt.outbox.application.has_log_adapter)
+
+    ensures: AttemptReported(attempt: attempt)
+}
+
+rule ReportAfterRelayActionFailure {
+    when: AfterRelayActionFailed(subscription, run, reason)
+
+    requires: subscription.has_log_adapter
+
+    -- The failure is reported and nothing else changes. The outcomes of
+    -- the run stand.
+    ensures: ErrorReported(subscription: subscription, reason: reason)
+}
+
 -- Finishing a relay run
 
 rule FinishRelayRun {
@@ -599,6 +682,24 @@ rule OperatorRaisesMaxAttempts {
     when: OperatorRaisesMaxAttempts(operator, outbox, max_attempts)
     requires: max_attempts > outbox.relay_attempts
     ensures: outbox.max_attempts = max_attempts
+}
+
+rule OperatorReattemptsDeadLetters {
+    when: OperatorReattemptsDeadLetters(operator, subscription)
+
+    -- Every dead-lettered outbox for the subscription is made pending
+    -- again in one step. Each gets a fresh allowance of attempts, the same
+    -- size as the subscription's maximum, and any wait is cleared.
+    ensures:
+        for outbox in subscription.outboxes where is_dead_lettered:
+            outbox.max_attempts = outbox.relay_attempts + subscription.max_attempts
+            outbox.manual_dead_letter = false
+            outbox.next_attempt_at = null
+    ensures: RelayRequested()
+
+    @guidance
+        -- An outbox past its delivery deadline has already expired and is
+        -- not dead-lettered any more, so it is not picked up.
 }
 
 rule OperatorSkipsOutbox {
@@ -759,11 +860,24 @@ surface OutboxReview {
         OperatorChangesRetentionEnd(operator, outbox, retained_until) when outbox.is_settled
         OperatorRequestsRelay(operator)
 
+    @guarantee OversizedTextNeverBlocksTheOutcome
+        -- An error or log too long to store is shortened. It never prevents
+        -- the outcome of an attempt being recorded.
+
     @guarantee NoDeletion
         -- Nobody can delete an outbox. A record leaves only when its
         -- retention period ends, and only after it is delivered, skipped
         -- or expired, so every outbox that is gone had a recorded outcome
         -- first.
+}
+
+surface SubscriptionReview {
+    facing operator: Operator
+
+    context subscription: Subscription
+
+    provides:
+        OperatorReattemptsDeadLetters(operator, subscription)
 }
 
 surface RelayClientIntegration {
@@ -776,7 +890,7 @@ surface RelayClientIntegration {
         -- An acceptance test goes through every subscription and passes its
         -- client settings to validate_settings on the relay client it
         -- names. The test fails if any client rejects its settings, or if
-        -- a subscription names a client that does not exist.
+        -- a subscription names something that is not a relay client.
 
     provides:
         RelaySucceeded(attempt)
@@ -789,6 +903,11 @@ surface MessageResolverIntegration {
     contracts:
         demands MessageResolver
 
+    @guarantee ResolverNameCheckedInAcceptanceTests
+        -- An acceptance test goes through every message definition that
+        -- names a resolver. The test fails if the name does not lead to a
+        -- message resolver.
+
     provides:
         MessageResolved(attempt, resolved_payload)
         MessageResolutionFailed(attempt, reason)
@@ -799,4 +918,39 @@ surface AfterRelayActionIntegration {
 
     contracts:
         demands AfterRelayAction
+
+    provides:
+        AfterRelayActionFailed(subscription, run, reason)
+
+    @guarantee ActionNameCheckedInAcceptanceTests
+        -- An acceptance test goes through every subscription that names an
+        -- after-relay action. The test fails if the name does not lead to
+        -- an after-relay action.
+}
+
+surface LoggingIntegration {
+    facing _: LogAdapterImplementation
+
+    contracts:
+        demands LogAdapter
+
+    @guarantee NamedBySubscription
+        -- The framework defines what a log adapter must do. The team that
+        -- installs the framework writes the adapter. Each subscription
+        -- names the adapter it reports to, so different endpoints can log
+        -- in different ways.
+
+    @guarantee WorksWithoutAnAdapter
+        -- A subscription that names no adapter is relayed as normal. The
+        -- only record is then what each of its outboxes holds about its
+        -- latest attempt.
+
+    @guarantee FallbackOnTheApplication
+        -- An application can name a fallback adapter. It receives reports
+        -- for the application's outboxes whose subscription is missing.
+
+    @guarantee AdapterNameCheckedInAcceptanceTests
+        -- An acceptance test goes through every subscription and every
+        -- application that names a log adapter. The test fails if a name
+        -- does not lead to a log adapter.
 }

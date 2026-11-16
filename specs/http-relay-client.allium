@@ -12,7 +12,7 @@
 --   - Message resolution (the client receives the resolved payload, if any)
 --   - Credential storage and placeholder substitution in the endpoint and
 --     headers (platform feature)
---   - Transport concerns: connection timeouts, TLS, redirects
+--   - Transport concerns: TLS, redirects
 --   - The Case example under example/
 
 use "./transactional-outbox.allium" as outbox
@@ -37,15 +37,19 @@ value HttpHeader {
 value HttpRelaySettings {
     endpoint: String?
     method: String?
+    timeout: Duration?
     headers: Set<HttpHeader>
 
-    -- Both the endpoint and the method are required, and neither has a
-    -- default. The endpoint must be a web address or a reference to a
-    -- stored credential. The method must be an HTTP method name. Headers
+    -- The endpoint, the method and the timeout are required, and none has
+    -- a default. The endpoint must be a web address or a reference to a
+    -- stored credential. The method must be an HTTP method name. The
+    -- timeout is how long to wait for the subscriber to answer. Headers
     -- are optional, but when given they must be name and value pairs.
     is_valid:
         endpoint != null and is_endpoint_format(endpoint)
         and method != null and is_http_method(method)
+        and timeout != null and timeout > 0.seconds and timeout <= config.longest_allowed_timeout
+        and are_name_value_pairs(headers)
 }
 
 value HttpResponse {
@@ -59,7 +63,7 @@ value HttpResponse {
 ------------------------------------------------------------
 
 contract HttpEndpoint {
-    exchange: (endpoint: String, method: String, headers: Set<HttpHeader>, body: String) -> HttpResponse
+    exchange: (endpoint: String, method: String, headers: Set<HttpHeader>, body: String, timeout: Duration) -> HttpResponse
 
     @invariant OneRequestPerAttempt
         -- The client makes exactly one request per relay attempt. It never
@@ -77,6 +81,7 @@ entity HttpExchange {
     method: String
     headers: Set<HttpHeader>
     body: String
+    timeout: Duration
     status: sent | accepted | rejected | unanswered
 
     -- Kept so that after-relay actions can inspect what the subscriber said.
@@ -100,6 +105,9 @@ config {
 
     -- Only a response with a status code in this range means the subscriber
     -- accepted the message.
+    -- The longest wait the platform allows for one request.
+    longest_allowed_timeout: Duration = 120.seconds
+
     lowest_accepted_status_code: Integer = 200
     highest_accepted_status_code: Integer = 299
 }
@@ -132,6 +140,7 @@ rule SendMessageOverHttp {
         method: settings.method,
         headers: settings.headers,
         body: body,
+        timeout: settings.timeout,
         status: sent
     )
 }
@@ -181,6 +190,8 @@ rule SubscriberRejectsMessage {
 }
 
 rule SubscriberDoesNotAnswer {
+    -- Covers a subscriber that cannot be reached and one that does not
+    -- answer within the timeout.
     when: HttpRequestFailed(exchange, reason)
 
     requires: exchange.status = sent
@@ -212,7 +223,8 @@ surface RelayRequests {
     @guarantee ValidationMatchesSending
         -- validate_settings rejects exactly the settings that would fail
         -- this check: a missing or malformed endpoint, a missing or
-        -- malformed method, or headers that are not name and value pairs.
+        -- malformed method, a missing or out-of-range timeout, or headers
+        -- that are not name and value pairs.
 
     @guarantee AttemptIsTraceable
         -- The attempt's log records the method, endpoint and body that were
