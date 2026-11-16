@@ -552,6 +552,11 @@ config {
     -- out of sight. A run can stop sooner when it runs short of budget,
     -- and never goes past this.
     relay_run_size: Integer = 100
+
+    -- How often the sweep asks for a relay run. A required setting whose
+    -- default is shown on the setting. This is the longest an outbox that
+    -- is ready can wait when nothing else starts a run.
+    relay_sweep_interval: Duration = 1.hour
 }
 
 ------------------------------------------------------------
@@ -597,8 +602,10 @@ rule SweepOutbox {
     ensures: RelayRequested()
 
     @guidance
-        -- The sweep runs every hour. It picks up outboxes whose backoff has
-        -- ended and recovers if an earlier run did not start its successor.
+        -- The sweep runs once every config.relay_sweep_interval. It is what
+        -- starts a run when nothing else does: an outbox whose backoff has
+        -- ended, a subscription whose pause has ended, a request that was
+        -- dropped, or a run that did not start its successor.
 }
 
 rule OperatorRequestsRelay {
@@ -1167,6 +1174,14 @@ surface RelaySchedule {
         RelaySweepDue()
         RelayRunEnded(run)
         RunLimitReached(attempt, reason)
+
+    @guarantee SweepIsSetUpAtActivation
+        -- The framework can be installed without being activated. Setting
+        -- up the sweep is part of activating it, and that is done and
+        -- checked by the team that puts the framework into use. The
+        -- framework does not check for it. Until the sweep is set up, a
+        -- relay run starts only when a message is published, a run hands
+        -- over to the next, or an operator asks.
 }
 
 surface OutboxReview {
