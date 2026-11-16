@@ -171,6 +171,22 @@ contract RelayClient {
         -- subscription uses isolated relay.
 }
 
+-- What the framework requires of any system that receives messages,
+-- whichever relay client carries them.
+contract Subscriber {
+    receive: (idempotency_key: String, message: OutboxMessage) -> Boolean
+
+    @invariant HandlesDuplicates
+        -- The same message can arrive more than once. The receiving system
+        -- must treat a delivery whose idempotency key it has already
+        -- accepted as a repeat, and must not act on it a second time.
+
+    @invariant AcceptanceMeansResponsibility
+        -- Once the receiving system reports that it accepted a message,
+        -- the framework will not send it again on purpose. Keeping the
+        -- message from then on is the receiving system's job.
+}
+
 contract MessageResolver {
     resolve: (messages: Set<OutboxMessage>) -> Set<ResolvedPayload>
 
@@ -998,4 +1014,17 @@ surface LoggingIntegration {
         -- An acceptance test goes through every subscription and every
         -- application that names a log adapter. The test fails if a name
         -- does not lead to a log adapter.
+}
+
+surface SubscriberObligations {
+    facing _: Application
+
+    contracts:
+        demands Subscriber
+
+    @guarantee DuplicatesAreTheSubscribersToHandle
+        -- The framework delivers at least once and gives every delivery a
+        -- stable idempotency key. It does not promise exactly once.
+        -- Recognising and discarding a repeat is required of the receiving
+        -- system, and the framework cannot check that it does so.
 }

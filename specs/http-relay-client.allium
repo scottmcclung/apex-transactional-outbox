@@ -65,6 +65,12 @@ value HttpResponse {
 contract HttpEndpoint {
     exchange: (endpoint: String, method: String, headers: Set<HttpHeader>, body: String, timeout: Duration) -> HttpResponse
 
+    @invariant HandlesRepeatedKeys
+        -- The endpoint must treat a request whose idempotency key it has
+        -- already accepted as a repeat of that delivery, and must not act
+        -- on it a second time. It should still answer with a 2xx status,
+        -- so that the outbox is recorded as delivered.
+
     @invariant OneRequestPerAttempt
         -- The client makes exactly one request per relay attempt. It never
         -- retries on its own. Retrying is the framework's decision.
