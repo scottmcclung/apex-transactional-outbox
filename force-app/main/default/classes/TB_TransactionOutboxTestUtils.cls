@@ -37,12 +37,34 @@ public class TB_TransactionOutboxTestUtils {
         return subscription;
     }
 
+    static Boolean finalizerMayQueueNextRun = false;
+
+    /**
+     * Call after publishing and before Test.stopTest().
+     *
+     * In production a relay run's finalizer has its own transaction, so the two static guards in
+     * TB_OutboxRelayQueuable.enqueue start out unset and the finalizer can queue the next run.
+     * In a test the publishing code, the run and the finalizer share statics, so both guards are
+     * still set when the finalizer gets there. This clears the publisher's guard now, and has
+     * TestClient clear the run's guard during its first send. The run must reach TestClient
+     * at least once for that to happen.
+     */
+    public static void letFinalizerQueueNextRun() {
+        TB_OutboxRelayQueuable.alreadyQueuedInContext = false;
+        finalizerMayQueueNextRun = true;
+    }
+
     // One entry per call to TestClient.send, holding the resolved message the client was given.
     @testVisible
     static List<Object> sentMessages = new List<Object>();
     public class TestClient implements TB_IOutboxRelayClient {
         public void send(TB_OutboxRelayContext ctx) {
             sentMessages.add(ctx.resolvedMessage);
+            if (finalizerMayQueueNextRun) {
+                // Cleared once, so only the first run's finalizer can queue and a test cannot chain without end.
+                finalizerMayQueueNextRun = false;
+                TB_OutboxRelayQueuable.executeStart = null;
+            }
             if (ctx.subscriptionConfig.containsKey('log')) {
                 ctx.log(ctx.subscriptionConfig.get('log'));
             }

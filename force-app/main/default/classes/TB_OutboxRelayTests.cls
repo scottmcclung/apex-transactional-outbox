@@ -728,4 +728,141 @@ public class TB_OutboxRelayTests {
             System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'Both deliveries should stay stored');
         }
     }
+
+    static TB_Message_Subscription__mdt addTestClientSubscription(
+        TB_Application__mdt app,
+        TB_Message_Definition__mdt msgDef,
+        String name
+    ) {
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(app, msgDef, name);
+        subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+        return subscription;
+    }
+
+    // The first job is the run the publish queued. A second job means that run's finalizer queued another.
+    static Integer relayJobCount() {
+        return [
+            SELECT COUNT()
+            FROM AsyncApexJob
+            WHERE JobType = 'Queueable' AND ApexClass.Name = 'TB_OutboxRelayQueuable'
+        ];
+    }
+
+    @isTest
+    static void testNextRunIsNotQueuedWhenEverythingWasDelivered() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        System.assertNotEquals(null, outboxesInOrder()[0].Completed_Timestamp__c, 'The outbox should be delivered');
+        System.assertEquals(1, relayJobCount(), 'No further run should be queued');
+    }
+
+    @isTest
+    static void testNextRunIsQueuedWhenAnOutboxWasPassedOver() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1').Isolate_Relay__c = true;
+        addTestClientSubscription(app, msgDef, 'subscription2');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        System.assertEquals(2, relayJobCount(), 'A second run should be queued for the outbox the isolated run left');
+        for (TB_Subscription_Outbox__c outbox : outboxesInOrder()) {
+            System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'Both outboxes should be delivered across the two runs');
+        }
+    }
+
+    @isTest
+    static void testNextRunIsQueuedAtOnceForFailureWithoutBackoff() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1').Config__c = '{"throwError":true}';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        System.assertEquals(2, relayJobCount(), 'A failed outbox with no backoff is still due, so a second run is queued');
+        System.assertEquals(2, outboxesInOrder()[0].Relay_Attempts__c, 'The second run should attempt it again');
+    }
+
+    @isTest
+    static void testNextRunIsNotQueuedForFailureWithBackoff() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'subscription1');
+        subscription.Config__c = '{"throwError":true}';
+        subscription.Retry_BackOff__c = '30';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        System.assertEquals(1, relayJobCount(), 'An outbox waiting on its backoff should not start another run');
+        System.assertEquals(1, outboxesInOrder()[0].Relay_Attempts__c);
+    }
+
+    /**
+     * The finalizer leaves out every group the run held, so a group whose first outbox failed
+     * with no backoff does not start another run, although the same failure without a group does.
+     */
+    @isTest
+    static void testNextRunIsNotQueuedForGroupHeldByFailure() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt failingDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, failingDef, 'subscription1').Config__c = '{"throwError":true}';
+        TB_Message_Definition__mdt workingDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, workingDef, 'subscription2');
+
+        TB_Outbox_Message__c first = newMessage(failingDef);
+        first.Group_Id__c = 'group1';
+        TB_Outbox_Message__c second = newMessage(workingDef);
+        second.Group_Id__c = 'group1';
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ first, second };
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(1, relayJobCount(), 'No further run should be queued for the held group');
+        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'The failed outbox should not be attempted again');
+        System.assertEquals(0, outboxes[1].Relay_Attempts__c, 'The later outbox in the group should not be attempted');
+    }
+
+    /**
+     * An isolated outbox that is not first in the run is passed over, and its group is held.
+     * The finalizer then leaves that group out, so nothing queues the run that would deliver it.
+     */
+    @isTest
+    static void testNextRunIsNotQueuedForGroupedIsolatedOutboxThatWasPassedOver() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+        addTestClientSubscription(app, msgDef, 'subscription2').Isolate_Relay__c = true;
+
+        TB_Outbox_Message__c message = newMessage(msgDef);
+        message.Group_Id__c = 'group1';
+
+        Test.startTest();
+        insert message;
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The first outbox should be delivered');
+        System.assertEquals(1, relayJobCount(), 'No further run should be queued');
+        System.assertEquals(0, outboxes[1].Relay_Attempts__c, 'The isolated outbox should be left unattempted');
+    }
 }
