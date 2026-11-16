@@ -1,4 +1,5 @@
 public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallouts {
+    @TestVisible
     static DateTime executeStart;
     public TB_OutboxRelayQueuable() {
     }
