@@ -19,19 +19,9 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         outboxRecordsUnsorted
       );
   
-      // group messages by type to resolve
-      Map<String, TB_Outbox_Message__c[]> msgsByType = new Map<String, TB_Outbox_Message__c[]>();
-      for (TB_Subscription_Outbox__c item : outboxRecords) {
-        if (!msgsByType.containsKey(item.Outbox_Message__r.Type__c)) {
-          msgsByType.put(
-            item.Outbox_Message__r.Type__c,
-            new List<TB_Outbox_Message__c>{}
-          );
-        }
-  
-        msgsByType.get(item.Outbox_Message__r.Type__c)
-          .add(item.Outbox_Message__r);
-      }
+      Map<String, TB_Outbox_Message__c[]> msgsByType = groupMessagesByType(
+        outboxRecords
+      );
   
       // transform DTO's
       Map<Id, Object> allResolvedMessages = resolveMessages(msgsByType);
@@ -40,15 +30,10 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         msgsByType.keySet()
       );
   
-      Map<String, TB_IAfterRelayAction> afterRelayActions = TB_OutboxMetadataProvider.getAfterRelayActionsMap(
-        subscriptionsMetadataMap.values()
-      );
-  
-      OutboxFinalizer finalizer = new OutboxFinalizer(
-        afterRelayActions,
+      OutboxFinalizer finalizer = attachFinalizer(
+        subscriptionsMetadataMap.values(),
         holds
       );
-      System.attachFinalizer(finalizer);
   
       Boolean isFirst = true;
       // Process Each Outbox
@@ -83,6 +68,49 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
       // attempt to save results with Lock
       finalizer.save();
+    }
+  
+    /**
+     * Message resolvers work on one message type at a time, in the order the outboxes will be processed.
+     * A message appears once for each of its outboxes.
+     */
+    private Map<String, TB_Outbox_Message__c[]> groupMessagesByType(
+      List<TB_Subscription_Outbox__c> outboxRecords
+    ) {
+      Map<String, TB_Outbox_Message__c[]> msgsByType = new Map<String, TB_Outbox_Message__c[]>();
+      for (TB_Subscription_Outbox__c item : outboxRecords) {
+        if (!msgsByType.containsKey(item.Outbox_Message__r.Type__c)) {
+          msgsByType.put(
+            item.Outbox_Message__r.Type__c,
+            new List<TB_Outbox_Message__c>{}
+          );
+        }
+  
+        msgsByType.get(item.Outbox_Message__r.Type__c)
+          .add(item.Outbox_Message__r);
+      }
+      return msgsByType;
+    }
+  
+    /**
+     * Builds the after-relay actions and attaches the finalizer before any attempt is made,
+     * so results are stored even if the run is stopped by a limit.
+     * An after-relay action class that cannot be built is thrown from here.
+     */
+    private OutboxFinalizer attachFinalizer(
+      List<TB_Message_Subscription__mdt> subscriptions,
+      GroupHolds holds
+    ) {
+      Map<String, TB_IAfterRelayAction> afterRelayActions = TB_OutboxMetadataProvider.getAfterRelayActionsMap(
+        subscriptions
+      );
+  
+      OutboxFinalizer finalizer = new OutboxFinalizer(
+        afterRelayActions,
+        holds
+      );
+      System.attachFinalizer(finalizer);
+      return finalizer;
     }
   
     /**
