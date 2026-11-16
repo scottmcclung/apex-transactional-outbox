@@ -82,6 +82,10 @@ entity HttpExchange {
     headers: Set<HttpHeader>
     body: String
     timeout: Duration
+
+    -- Sent as a request header, in addition to the configured headers.
+    idempotency_key: String
+
     status: sent | accepted | rejected | unanswered
 
     -- Kept so that after-relay actions can inspect what the subscriber said.
@@ -105,6 +109,9 @@ config {
 
     -- Only a response with a status code in this range means the subscriber
     -- accepted the message.
+    -- The name of the request header that carries the idempotency key.
+    idempotency_header: String = "Idempotency-Key"
+
     -- The longest wait the platform allows for one request.
     longest_allowed_timeout: Duration = 120.seconds
 
@@ -141,6 +148,7 @@ rule SendMessageOverHttp {
         headers: settings.headers,
         body: body,
         timeout: settings.timeout,
+        idempotency_key: attempt.outbox.idempotency_key,
         status: sent
     )
 }
@@ -241,4 +249,10 @@ surface SubscriberDelivery {
     provides:
         HttpResponseReceived(exchange, response)
         HttpRequestFailed(exchange, reason)
+
+    @guarantee RepeatsAreRecognisable
+        -- Every request carries the outbox's idempotency key in the
+        -- idempotency header. The key is the same on every attempt for
+        -- that outbox, and a header of the same name in the subscription's
+        -- settings does not replace it.
 }

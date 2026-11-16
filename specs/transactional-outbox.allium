@@ -150,6 +150,11 @@ contract RelayClient {
         -- They fail that one attempt. They never stop the relay run or
         -- affect other outboxes.
 
+    @invariant PassesTheIdempotencyKey
+        -- The client gives the subscriber the outbox's idempotency key with
+        -- every send, unchanged, so the subscriber can recognise a message
+        -- it has already received.
+
     @invariant MayShapeTheOutcome
         -- During a send the client may add to the outbox log, attach a
         -- result for after-relay actions, and ask for a specific next
@@ -252,6 +257,12 @@ entity OutboxMessage {
 -- Tracks delivery of one message to one subscription.
 entity SubscriptionOutbox {
     message: OutboxMessage
+
+    -- Identifies this delivery: one message to one subscription. It is set
+    -- when the outbox is created and never changes, so every attempt for
+    -- the outbox carries the same key. A subscriber that receives the
+    -- message twice can recognise the repeat by it.
+    idempotency_key: String
 
     -- Linked by the subscription's name. Absent while no subscription has
     -- that name, and linked again if one is restored.
@@ -447,6 +458,7 @@ rule PublishMessage {
         for subscription in definition.subscriptions where enabled:
             SubscriptionOutbox.created(
                 message: message,
+                idempotency_key: new_idempotency_key(),
                 subscription: subscription,
                 application: subscription.application,
                 max_attempts: subscription.max_attempts,
@@ -800,6 +812,12 @@ invariant CompletedOnlyAfterSuccess {
         outbox.is_completed implies outbox.attempts.any(a => a.status = succeeded)
 }
 
+invariant IdempotencyKeysAreUnique {
+    for a in SubscriptionOutboxes:
+        for b in SubscriptionOutboxes:
+            a != b implies a.idempotency_key != b.idempotency_key
+}
+
 invariant OneOutboxPerSubscription {
     for a in SubscriptionOutboxes:
         for b in SubscriptionOutboxes:
@@ -835,7 +853,8 @@ surface Publishing {
         -- delivered only after its relay client reports success. If a run is
         -- cut short before an outcome is recorded, the outbox stays pending
         -- and is attempted again, so a subscriber can receive the same
-        -- message more than once.
+        -- message more than once. Every attempt carries the outbox's
+        -- idempotency key, which lets the subscriber discard a repeat.
 
     @guarantee GroupOrder
         -- Within a group, a subscription never receives a message before
@@ -859,6 +878,7 @@ surface OutboxReview {
     context outbox: SubscriptionOutbox
 
     exposes:
+        outbox.idempotency_key
         outbox.message.payload
         outbox.message.group_id
         outbox.relay_attempts
