@@ -1,0 +1,1473 @@
+-- allium: 3
+-- transactional-outbox.allium
+
+-- Scope: the transactional outbox framework. A publisher records a message as
+-- part of its own transaction. The framework then relays that message to every
+-- subscriber, retrying on failure, until it is delivered or set aside.
+-- Includes: OutboxMessage, SubscriptionOutbox, RelayRun, RelayAttempt, fan-out,
+--   relay, retry backoff, dead-lettering, message groups, isolated relay,
+--   after-relay actions, the log adapter, time-to-live cleanup, the contracts for relay clients,
+--   message resolvers and after-relay actions
+-- Excludes:
+--   - The bundled HTTP relay client (http-relay-client.allium)
+--   - How applications, message definitions and subscriptions are authored
+--     (administrator configuration, read-only here)
+--   - Platform resource limits and job scheduling mechanics
+--   - Circuit breaking and message uniqueness controls (planned, not built)
+--   - The Case example under example/
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A person using the system. Outbox administrators can review and correct
+-- outbox records.
+external entity User {
+    is_outbox_admin: Boolean
+}
+
+-- Code elsewhere in the system that publishes messages as part of its own work.
+external entity PublishingProcess {}
+
+-- Whatever starts the periodic relay sweep.
+external entity SchedulingService {}
+
+-- The pluggable code a subscription or message definition names.
+external entity RelayClientImplementation {}
+external entity MessageResolverImplementation {}
+external entity AfterRelayActionImplementation {}
+
+-- Written by the team that installs the framework. It passes what the
+-- framework reports to whatever logging that organisation uses.
+external entity LogAdapterImplementation {}
+
+-- Opaque data whose shape belongs to the pluggable code that produces or
+-- reads it.
+external entity ResolvedPayload {}
+external entity RelayResult {}
+external entity ClientSettings {}
+
+-- A set of related subscriptions. It is the only level at which
+-- subscriptions are grouped. An application usually stands for one
+-- receiving system. One receiving system can be set up as several
+-- applications.
+external entity Application {
+    name: String
+
+    -- Whether an undelivered message on one subscription holds back the
+    -- application's other subscriptions for that message group. Required.
+    group_order: GroupOrder
+
+    -- Whether the application names a fallback log adapter. Optional. It
+    -- is used for an outbox whose subscription is missing, because there
+    -- is then no subscription to say where reports go.
+    has_log_adapter: Boolean
+}
+
+external entity MessageDefinition {
+    name: String
+
+    -- When true, the message is looked up or reshaped by a resolver just
+    -- before it is relayed.
+    has_resolver: Boolean
+
+    delete_when_outbox_empty: Boolean
+
+    subscriptions: Subscription with message_definition = this
+}
+
+-- Says which application receives which kind of message, and how.
+external entity Subscription {
+    application: Application
+    message_definition: MessageDefinition
+
+    -- Only decides whether new outboxes are created. Outboxes that already
+    -- exist are still relayed after a subscription is disabled.
+    enabled: Boolean
+
+    -- The name of the relay client that delivers for this subscription.
+    relay_client: String
+
+    -- Written by whoever sets up the subscription. The framework does not
+    -- interpret these. Only the named relay client knows what they mean.
+    client_settings: ClientSettings?
+
+    max_attempts: Integer
+
+    -- Wait before each retry. The first entry applies after the first failed
+    -- attempt. The last entry repeats once the list runs out. Required: a
+    -- subscription cannot be saved without one. A wait of zero asks for an
+    -- immediate retry.
+    retry_backoff: List<Duration>
+
+    -- The longest a message may stay undelivered to this subscription,
+    -- counted from when its outbox is created. Required, in whole minutes.
+    -- There is no way to say "never". A subscription whose messages should
+    -- not expire is given a period long enough to amount to that.
+    ttl: Duration
+
+    -- How long an outbox record is kept, counted from when it is settled:
+    -- delivered, skipped by an operator, or expired. Required, in whole
+    -- minutes. As with the time-to-live, "keep indefinitely" is written
+    -- as a very long period.
+    retention: Duration
+
+    isolate_relay: Boolean
+    has_after_relay_action: Boolean
+
+    -- Whether the subscription names a log adapter. Optional. Each
+    -- subscription chooses its own, so logging can differ from one
+    -- endpoint to another.
+    has_log_adapter: Boolean
+
+    -- How long sending to this subscription stops each time it is paused.
+    -- The first entry applies to the first pause, the second to the next
+    -- pause in a row, and so on. When the list is used up, the subscription
+    -- is stopped until an operator restarts it. Required.
+    pause_backoff: List<Duration>
+
+    outboxes: SubscriptionOutbox with subscription = this
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- What one send is expected to use of the limits a relay run works within.
+-- A relay client states this for each subscription, so the run can tell
+-- whether there is room for another attempt before it starts one.
+value SendCost {
+    callouts: Integer
+    callout_time: Duration
+    queries: Integer
+    query_rows: Integer
+    write_statements: Integer
+    write_rows: Integer
+    event_publishes: Integer
+    processing_time: Duration
+    memory: Integer
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract RelayClient {
+    send: (attempt: RelayAttempt) -> Boolean
+    validate_settings: (settings: ClientSettings?) -> Boolean
+    cost_of_send: (subscription: Subscription) -> SendCost
+
+    @invariant FailureIsExplicit
+        -- The client must signal failure when the subscriber did not take
+        -- the message. Anything else is treated as delivered.
+
+    @invariant OneOutboxPerSend
+        -- Each send delivers one message for one subscription. The framework
+        -- calls send once per attempt.
+
+    @invariant OwnsItsSettings
+        -- The client is responsible for validating the client settings of
+        -- every subscription that names it. validate_settings signals
+        -- failure, with a reason that says what is wrong, when the settings
+        -- are missing something the client needs or are malformed for it.
+
+    @invariant SameJudgementWhenSending
+        -- Settings that validate_settings would reject also fail a send.
+        -- They fail that one attempt. They never stop the relay run or
+        -- affect other outboxes.
+
+    @invariant DeclaresTheCostOfOneSend
+        -- cost_of_send states the most that one send for the subscription
+        -- will use: outbound calls and the time they may take, queries and
+        -- the rows they return, writes, event publishes, processing time
+        -- and memory. A client that looks up records before sending counts
+        -- those queries here.
+
+    @invariant CostMustFitOneRun
+        -- validate_settings rejects settings under which one send would
+        -- need more than a whole relay run has, such as a wait for the
+        -- subscriber longer than a run may spend on outbound calls. Such a
+        -- send could never start.
+
+    @invariant MayPauseItsSubscription
+        -- During a send the client may ask the framework to pause its
+        -- subscription, for example when the subscriber says it is being
+        -- sent too much. The client decides this from what one response
+        -- says. The framework does not pause a subscription by itself from
+        -- a pattern of failures. How long the pause lasts comes from the
+        -- subscription's pause backoff, not from the client. While a
+        -- subscription is paused or stopped its outboxes are left alone and
+        -- are not charged an attempt.
+
+    @invariant PassesTheIdempotencyKey
+        -- The client gives the subscriber the outbox's idempotency key with
+        -- every send, unchanged, so the subscriber can recognise a message
+        -- it has already received.
+
+    @invariant MayShapeTheOutcome
+        -- During a send the client may add to the outbox log, attach a
+        -- result for after-relay actions, and ask for a specific next
+        -- attempt time.
+
+    @invariant MayChangeDeadlineAndRetention
+        -- During a send the client may give the outbox a different delivery
+        -- deadline or a different retention period, for cases where the
+        -- value has to be worked out at run time. It can replace either
+        -- value. It cannot clear one.
+
+    @guidance
+        -- A client should not change stored records while sending unless its
+        -- subscription uses isolated relay.
+        --
+        -- A client should not look up records during a send. A send happens
+        -- once per outbox, so a lookup there costs one query per outbox.
+        -- Record state belongs in the message resolver, which is called once
+        -- for all the messages of a type. Subscribers that need different
+        -- data about the same event are given separate message definitions,
+        -- each with its own resolver.
+        --
+        -- Deciding what a message contains is the message definition's job
+        -- and its resolver's. A relay client delivers what it is given. It
+        -- should not take on shaping the message for its subscriber.
+}
+
+-- What the framework requires of any system that receives messages,
+-- whichever relay client carries them.
+contract Subscriber {
+    receive: (idempotency_key: String, message: OutboxMessage) -> Boolean
+
+    @invariant HandlesDuplicates
+        -- The same message can arrive more than once. The receiving system
+        -- must treat a delivery whose idempotency key it has already
+        -- accepted as a repeat, and must not act on it a second time.
+
+    @invariant AcceptanceMeansResponsibility
+        -- Once the receiving system reports that it accepted a message,
+        -- the framework will not send it again on purpose. Keeping the
+        -- message from then on is the receiving system's job.
+}
+
+contract MessageResolver {
+    resolve: (messages: Set<OutboxMessage>) -> Set<ResolvedPayload>
+
+    @invariant ResolvedTogether
+        -- Messages of the same type that are relayed in one run are resolved
+        -- together, so a resolver can look up what it needs once.
+
+    @invariant FailureFailsEveryMessage
+        -- If the resolver fails, every message it was asked to resolve fails
+        -- its relay attempt.
+}
+
+contract AfterRelayAction {
+    execute: (attempts: Set<RelayAttempt>) -> Boolean
+
+    @invariant NoDeliveryGuarantee
+        -- An action that fails is not retried and does not change whether a
+        -- message counts as delivered.
+}
+
+contract LogAdapter {
+    record_attempt: (attempt: RelayAttempt) -> Boolean
+    record_error: (reason: String) -> Boolean
+
+    @invariant EveryAttemptIsReported
+        -- The framework reports every relay attempt once its outcome is
+        -- known, whether it succeeded or failed. The report carries what
+        -- was logged during the attempt, the result the relay client
+        -- attached, such as the subscriber's response, and the reason for
+        -- any failure. The adapter decides what to keep, so an organisation
+        -- can log successes, failures or both as its needs require.
+
+    @invariant ErrorsOutsideAttemptsAreReported
+        -- The framework also reports failures that belong to a subscription
+        -- but not to one attempt: its after-relay action failing, a relay
+        -- run reaching one of its limits during an attempt, and sending to
+        -- the subscription being stopped.
+
+    @invariant AlsoTheNotificationChannel
+        -- Logging and notifying happen at the same point, so they share
+        -- this one interface. The framework sends no notifications of its
+        -- own. An organisation that wants someone told about an error has
+        -- its adapter do that.
+
+    @invariant OnlyWhereItIsNamed
+        -- An adapter receives reports for the subscriptions that name it.
+        -- An adapter named on an application receives reports for that
+        -- application's outboxes whose subscription is missing. It
+        -- receives nothing else.
+
+    @invariant NeverAffectsDelivery
+        -- An adapter that fails does not change the outcome of an attempt,
+        -- stop the relay run, or prevent outcomes being recorded.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How far message group order reaches within an application.
+-- shared_across_subscriptions: the application sees one sequence. A message
+--   waits until every earlier message in its group is settled on all of the
+--   application's subscriptions.
+-- per_subscription: each subscription keeps its own sequence. A message
+--   waits only on earlier messages for the same subscription.
+enum GroupOrder { shared_across_subscriptions | per_subscription }
+
+
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+entity OutboxMessage {
+    -- Linked by the definition's name. Absent while no definition has that
+    -- name, and linked again if one is restored.
+    definition: MessageDefinition?
+    payload: String?
+
+    -- Messages that share a group are delivered in the order they were
+    -- published.
+    group_id: String?
+
+    -- Publish order. Later messages have higher numbers.
+    sequence_number: Integer
+
+    outboxes: SubscriptionOutbox with message = this
+
+    is_drained: outboxes.count = 0
+}
+
+-- Tracks delivery of one message to one subscription.
+entity SubscriptionOutbox {
+    message: OutboxMessage
+
+    -- Identifies this delivery: one message to one subscription. It is set
+    -- when the outbox is created and never changes, so every attempt for
+    -- the outbox carries the same key. A subscriber that receives the
+    -- message twice can recognise the repeat by it. The key is generated
+    -- for this purpose and does not depend on where the record is stored,
+    -- so it stays valid if records are moved between systems.
+    idempotency_key: String
+
+    -- Linked by the subscription's name. Absent while no subscription has
+    -- that name, and linked again if one is restored.
+    subscription: Subscription?
+    application: Application
+
+    -- Copied from the subscription when the outbox is created, so later
+    -- changes to the subscription do not affect it.
+    max_attempts: Integer
+    relay_attempts: Integer
+
+    -- pending: waiting to be delivered, or between attempts.
+    -- dead_lettered: set aside. Nothing is attempted until an operator acts
+    --   or the delivery deadline passes.
+    -- completed: the relay client reported a delivery.
+    -- skipped: an operator decided it will not be delivered.
+    -- expired: the delivery deadline passed before it was delivered.
+    status: pending | dead_lettered | completed | skipped | expired
+
+    transitions status {
+        pending -> completed
+        pending -> dead_lettered
+        dead_lettered -> pending
+        pending -> skipped
+        dead_lettered -> skipped
+        pending -> expired
+        dead_lettered -> expired
+        terminal: completed, skipped, expired
+    }
+
+    -- True when an operator set the outbox aside by hand. An outbox is also
+    -- dead-lettered, without this, when its attempts reach its maximum.
+    manual_dead_letter: Boolean
+
+    -- A copy of the subscription's backoff, taken when the outbox is
+    -- created. It is a backup, used only while the subscription is missing.
+    -- Absent only on outboxes created before the copy was kept.
+    retry_backoff: List<Duration>?
+
+    last_attempt_at: Timestamp?
+    next_attempt_at: Timestamp?
+
+    -- Each way of settling keeps its own record, and only in that state.
+    -- A skip is never read as a delivery, and a decision the system made is
+    -- never mistaken for one a person made.
+    completed_at: Timestamp when status = completed
+    skipped_at: Timestamp when status = skipped
+    skipped_by: User when status = skipped
+    expired_at: Timestamp when status = expired
+
+    -- The reason the most recent attempt failed.
+    last_error: String?
+
+    -- What was logged during the most recent attempt only. It is cleared
+    -- when a new attempt starts. The full history of attempts is whatever
+    -- the log adapter recorded.
+    log: String?
+
+    -- The time-to-live deadline. An outbox still undelivered at this time
+    -- expires.
+    delivery_deadline: Timestamp?
+
+    -- A copy of the subscription's retention, taken when the outbox is
+    -- created. It is a backup, used only while the subscription is missing.
+    retention: Duration?
+
+    -- A retention period a relay client chose for this outbox. When set, it
+    -- is used in place of the subscription's.
+    retention_override: Duration?
+
+    -- The end of the retention period. It exists only once the outbox is
+    -- settled, and the record is removed after it. A later change to the
+    -- subscription's retention does not move it. Only an operator can
+    -- change it.
+    retained_until: Timestamp? when status = completed | skipped | expired
+
+    attempts: RelayAttempt with outbox = this
+    group_siblings: SubscriptionOutbox with application = this.application and message.group_id = this.message.group_id
+
+    -- Nothing more will be done for this outbox.
+    is_settled: status in {completed, skipped, expired}
+
+    is_pending: status = pending
+    is_backing_off: next_attempt_at != null and next_attempt_at > now
+
+    -- An earlier message in the same group is not settled yet. Whether
+    -- another subscription's outbox counts depends on the application.
+    is_held_by_group:
+        message.group_id != null
+        and group_siblings.any(s =>
+            s.message.sequence_number < message.sequence_number
+            and not s.is_settled
+            and (application.group_order = shared_across_subscriptions or s.subscription = subscription))
+
+    is_past_deadline: delivery_deadline != null and delivery_deadline <= now
+
+    -- A relay attempt for this outbox has started and its outcome is not
+    -- known yet. While this holds, the outbox cannot be skipped or expired,
+    -- so a delivery that is under way always gets to decide the outcome.
+    has_attempt_in_progress:
+        attempts.any(a => a.status in {resolving, sending} and a.run.is_running)
+
+    -- The outbox's subscription is paused or stopped. The delivery deadline
+    -- keeps running in the meantime, so an outbox can expire while it waits.
+    is_subscription_held:
+        SubscriptionBreakers.any(b => b.subscription = subscription and b.status != active)
+
+    is_due:
+        is_pending and not is_past_deadline and not is_backing_off
+        and not is_held_by_group and not is_subscription_held
+
+    has_configuration: subscription != null and message.definition != null
+
+    -- The subscription's current backoff comes first, so a change to it
+    -- takes effect on outboxes that already exist. The outbox's own copy
+    -- covers a missing subscription. The system fallback covers a missing
+    -- subscription whose outbox has no copy.
+    effective_retry_backoff:
+        subscription?.retry_backoff ?? retry_backoff ?? [config.fallback_retry_wait]
+
+    -- A relay client's choice for this outbox comes first, then the
+    -- subscription's current retention. The outbox's own copy covers a
+    -- missing subscription.
+    effective_retention: retention_override ?? subscription?.retention ?? retention
+
+    invariant AttemptsNeverNegative {
+        relay_attempts >= 0
+    }
+
+    invariant DeadLetteredForAReason {
+        status = dead_lettered implies (relay_attempts >= max_attempts or manual_dead_letter)
+    }
+
+    invariant PendingHasAttemptsLeft {
+        status = pending implies (relay_attempts < max_attempts and not manual_dead_letter)
+    }
+}
+
+-- One pass over the outbox.
+entity RelayRun {
+    status: running | finished
+
+    attempts: RelayAttempt with run = this
+
+    is_running: status = running
+
+    transitions status {
+        running -> finished
+        terminal: finished
+    }
+}
+
+-- One try at delivering one outbox.
+entity RelayAttempt {
+    run: RelayRun
+    outbox: SubscriptionOutbox
+    -- abandoned: the run reached one of its own limits during the attempt.
+    -- That is the run's doing and says nothing about the subscriber.
+    status: resolving | sending | succeeded | failed | abandoned
+
+    resolved_payload: ResolvedPayload?
+
+    -- Set by the relay client.
+    result: RelayResult?
+    requested_next_attempt_at: Timestamp?
+    requested_delivery_deadline: Timestamp?
+    requested_retention: Duration?
+
+    transitions status {
+        resolving -> sending
+        resolving -> failed
+        sending -> succeeded
+        sending -> failed
+        resolving -> abandoned
+        sending -> abandoned
+        terminal: succeeded, failed, abandoned
+    }
+}
+
+-- Whether the framework is currently sending to a subscription. This is a
+-- circuit breaker. A struggling subscriber is left alone for longer each
+-- time, and in the end sending stops until a person restarts it.
+entity SubscriptionBreaker {
+    subscription: Subscription
+    status: active | paused | stopped
+
+    -- Pauses in a row since the last successful delivery.
+    pause_count: Integer
+    paused_until: Timestamp?
+
+    transitions status {
+        active -> paused
+        paused -> active
+        active -> stopped
+        stopped -> active
+    }
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The wait between attempts when the subscription is missing and the
+    -- outbox has no copy of its backoff.
+    fallback_retry_wait: Duration = 12.hours
+
+    -- Settings that belong to the framework as a whole are kept together
+    -- in one place, apart from applications, message definitions and
+    -- subscriptions.
+
+    -- The most attempts one relay run makes. It is a required setting that
+    -- an organisation changes to suit its scale. The setting itself shows
+    -- its default of 100, so the value in use is never an assumption made
+    -- out of sight. A run can stop sooner when it runs short of budget,
+    -- and never goes past this.
+    relay_run_size: Integer = 100
+
+    -- How often the sweep and cleanup run is not a framework setting. Both
+    -- are scheduled by the team that activates the framework, and that
+    -- schedule is theirs to choose.
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- Publishing
+
+rule PublishMessage {
+    when: PublishMessage(message_type, payload, group_id?)
+
+    let definition = MessageDefinition{name: message_type}
+
+    requires: exists definition
+
+    ensures:
+        let message = OutboxMessage.created(
+            definition: definition,
+            payload: payload,
+            group_id: group_id,
+            sequence_number: next_sequence_number()
+        )
+        for subscription in definition.subscriptions where enabled:
+            SubscriptionOutbox.created(
+                message: message,
+                idempotency_key: new_idempotency_key(),
+                subscription: subscription,
+                application: subscription.application,
+                max_attempts: subscription.max_attempts,
+                retry_backoff: subscription.retry_backoff,
+                relay_attempts: 0,
+                status: pending,
+                manual_dead_letter: false,
+                delivery_deadline: now + subscription.ttl,
+                retention: subscription.retention
+            )
+        RelayRequested()
+}
+
+-- Starting a relay run
+
+rule SweepOutbox {
+    when: RelaySweepDue()
+    ensures: RelayRequested()
+
+    @guidance
+        -- The sweep is what starts a run when nothing else does: an outbox
+        -- whose backoff has ended, a subscription whose pause has ended, a
+        -- request that was dropped, or a run that did not start its
+        -- successor. How often it runs is chosen at activation, and that
+        -- interval is the longest a ready outbox waits in those cases.
+}
+
+rule OperatorRequestsRelay {
+    when: OperatorRequestsRelay(operator)
+    ensures: RelayRequested()
+}
+
+rule StartRelayRun {
+    when: RelayRequested()
+
+    -- Only one run at a time. A request made while a run is in progress is
+    -- dropped. That run starts a successor if work remains.
+    requires: not RelayRuns.any(r => r.status = running)
+
+    ensures: RelayRun.created(status: running)
+}
+
+rule OfferRelayTurns {
+    when: run: RelayRun.created
+
+    ensures:
+        for outbox in SubscriptionOutboxes where is_pending:
+            RelayTurnOffered(run: run, outbox: outbox)
+
+    @guidance
+        -- Turns are taken one at a time in publish order. Each outbox is
+        -- judged when its turn comes, so the result of an earlier attempt in
+        -- the run affects later turns.
+}
+
+-- Attempting delivery
+
+rule BeginRelayAttempt {
+    when: RelayTurnOffered(run, outbox)
+
+    requires: run.status = running
+    requires: outbox.is_due
+    requires: outbox.has_configuration
+
+    -- A run makes no more attempts than its size allows.
+    requires: run.attempts.count < config.relay_run_size
+
+    -- An attempt starts only when the run has room for what the relay
+    -- client says one send needs. has_budget_for compares that cost with
+    -- what is left of every limit the run works within: outbound calls,
+    -- total time spent on outbound calls, queries, rows returned by
+    -- queries, writes, event publishes, processing time and memory.
+    -- An outbox that is passed over for lack of room is not attempted, so
+    -- it is not charged an attempt. It waits for the next run.
+    requires: has_budget_for(run, cost_of_send(outbox.subscription))
+
+    -- Once a run has reached one of its limits it starts nothing more.
+    requires: not run.attempts.any(a => a.status = abandoned)
+
+    -- An isolated outbox is only attempted as the first attempt of a run,
+    -- and the run attempts nothing else after it.
+    requires: not outbox.subscription.isolate_relay or run.attempts.count = 0
+    requires: not run.attempts.any(a => a.outbox.subscription != null and a.outbox.subscription.isolate_relay)
+
+    ensures: outbox.relay_attempts = outbox.relay_attempts + 1
+    ensures: outbox.last_attempt_at = now
+    ensures: outbox.next_attempt_at = null
+    ensures: outbox.log = null
+    ensures:
+        if outbox.message.definition.has_resolver:
+            RelayAttempt.created(run: run, outbox: outbox, status: resolving)
+        else:
+            RelayAttempt.created(run: run, outbox: outbox, status: sending)
+}
+
+rule FailAttemptWithoutConfiguration {
+    when: RelayTurnOffered(run, outbox)
+
+    requires: run.status = running
+    requires: outbox.status = pending
+    requires: outbox.is_due
+    requires: not outbox.has_configuration
+    requires: run.attempts.count < config.relay_run_size
+
+    -- The attempt counts and leaves a record, so an operator can see why
+    -- the outbox is not being delivered. It is retried like any failure,
+    -- because a subscription or definition removed by mistake can be
+    -- restored. Nothing is sent, and the run carries on with other outboxes.
+    ensures: outbox.relay_attempts = outbox.relay_attempts + 1
+    ensures: outbox.last_attempt_at = now
+    ensures: outbox.log = null
+    ensures: outbox.last_error = missing_configuration_reason(outbox)
+    ensures: RelayAttempt.created(run: run, outbox: outbox, status: failed)
+    ensures: outbox.next_attempt_at =
+        now + backoff_delay(outbox.effective_retry_backoff, outbox.relay_attempts)
+    ensures:
+        if outbox.relay_attempts >= outbox.max_attempts:
+            outbox.status = dead_lettered
+}
+
+rule RequestResolution {
+    when: attempt: RelayAttempt.created
+    requires: attempt.status = resolving
+    ensures: ResolutionRequested(attempt: attempt)
+}
+
+rule RequestSendWithoutResolution {
+    when: attempt: RelayAttempt.created
+    requires: attempt.status = sending
+    ensures: SendRequested(attempt: attempt)
+}
+
+rule MessageResolved {
+    when: MessageResolved(attempt, resolved_payload)
+
+    requires: attempt.status = resolving
+
+    ensures: attempt.status = sending
+    ensures: attempt.resolved_payload = resolved_payload
+    ensures: SendRequested(attempt: attempt)
+}
+
+rule MessageResolutionFailed {
+    when: MessageResolutionFailed(attempt, reason)
+
+    requires: attempt.status = resolving
+
+    -- A message that cannot be resolved uses up an attempt, the same as a
+    -- failed send.
+    ensures: RelayFailed(attempt: attempt, reason: reason)
+}
+
+rule RecordRelaySuccess {
+    when: RelaySucceeded(attempt)
+
+    requires: attempt.status = sending
+
+    -- An outcome that arrives after its run has ended is not accepted.
+    requires: attempt.run.is_running
+
+    let outbox = attempt.outbox
+
+    requires: outbox.status = pending
+
+    ensures: attempt.status = succeeded
+    ensures: outbox.status = completed
+    ensures: outbox.completed_at = now
+    ensures: outbox.retention_override = attempt.requested_retention ?? outbox.retention_override
+    ensures: outbox.retained_until =
+        now + (attempt.requested_retention ?? outbox.effective_retention)
+}
+
+rule RecordRelayFailure {
+    when: RelayFailed(attempt, reason)
+
+    requires: attempt.status in {resolving, sending}
+    requires: attempt.run.is_running
+
+    let outbox = attempt.outbox
+
+    requires: outbox.status = pending
+
+    ensures: attempt.status = failed
+    ensures: outbox.last_error = reason
+
+    -- Changes the client asked for are kept even though the send failed.
+    ensures: outbox.delivery_deadline = attempt.requested_delivery_deadline ?? outbox.delivery_deadline
+    ensures: outbox.retention_override = attempt.requested_retention ?? outbox.retention_override
+
+    -- The client's requested time wins over the backoff.
+    -- backoff_delay picks the entry for this attempt number, repeating the
+    -- last entry once the list runs out.
+    ensures: outbox.next_attempt_at =
+        attempt.requested_next_attempt_at
+        ?? now + backoff_delay(outbox.effective_retry_backoff, outbox.relay_attempts)
+
+    -- The delivery deadline may have passed while this attempt was under
+    -- way. Expiry waited for the attempt, so it happens now. Otherwise the
+    -- outbox is dead-lettered once its attempts reach its maximum, and
+    -- stays pending if it has attempts left.
+    ensures:
+        if outbox.is_past_deadline:
+            outbox.status = expired
+            outbox.expired_at = now
+            outbox.retained_until = now + outbox.effective_retention
+        else if outbox.relay_attempts >= outbox.max_attempts:
+            outbox.status = dead_lettered
+}
+
+-- Pausing and stopping a subscription
+
+rule StartTrackingSubscription {
+    when: outbox: SubscriptionOutbox.created
+
+    requires: not exists SubscriptionBreaker{subscription: outbox.subscription}
+
+    ensures: SubscriptionBreaker.created(subscription: outbox.subscription, status: active, pause_count: 0)
+}
+
+rule PauseSubscription {
+    when: SubscriptionPauseRequested(attempt)
+
+    let subscription = attempt.outbox.subscription
+    let breaker = SubscriptionBreaker{subscription: subscription}
+
+    requires: exists breaker
+    requires: breaker.status = active
+    requires: breaker.pause_count < subscription.pause_backoff.count
+
+    -- Each pause in a row lasts as long as the next entry in the
+    -- subscription's pause backoff.
+    ensures: breaker.status = paused
+    ensures: breaker.pause_count = breaker.pause_count + 1
+    ensures: breaker.paused_until = now + backoff_delay(subscription.pause_backoff, breaker.pause_count + 1)
+}
+
+rule StopSubscription {
+    when: SubscriptionPauseRequested(attempt)
+
+    let subscription = attempt.outbox.subscription
+    let breaker = SubscriptionBreaker{subscription: subscription}
+
+    requires: exists breaker
+    requires: breaker.status = active
+    requires: breaker.pause_count >= subscription.pause_backoff.count
+
+    -- The pause backoff is used up. Nothing more is sent to this
+    -- subscription until an operator restarts it.
+    ensures: breaker.status = stopped
+    ensures: breaker.paused_until = null
+    ensures: ErrorReported(subscription: subscription, reason: "Sending to this subscription has stopped. It was paused as many times in a row as its pause backoff allows. An operator must restart it.")
+}
+
+rule ResumeSubscription {
+    when: breaker: SubscriptionBreaker.paused_until <= now
+
+    requires: breaker.status = paused
+
+    -- Sending starts again. The count of pauses in a row is kept, so a
+    -- subscriber that is still struggling gets a longer pause next time.
+    ensures: breaker.status = active
+    ensures: breaker.paused_until = null
+    ensures: RelayRequested()
+}
+
+rule ClearPausesAfterDelivery {
+    when: attempt: RelayAttempt.status becomes succeeded
+
+    let breaker = SubscriptionBreaker{subscription: attempt.outbox.subscription}
+
+    requires: exists breaker
+
+    -- A delivery shows the subscriber is taking messages again.
+    ensures: breaker.pause_count = 0
+}
+
+rule OperatorRestartsSubscription {
+    when: OperatorRestartsSubscription(operator, subscription)
+
+    let breaker = SubscriptionBreaker{subscription: subscription}
+
+    requires: exists breaker
+    requires: breaker.status = stopped
+
+    ensures: breaker.status = active
+    ensures: breaker.pause_count = 0
+    ensures: RelayRequested()
+}
+
+rule OperatorEndsPause {
+    when: OperatorEndsPause(operator, subscription)
+
+    let breaker = SubscriptionBreaker{subscription: subscription}
+
+    requires: exists breaker
+    requires: breaker.status = paused
+
+    -- For when an operator knows the subscriber has recovered and does not
+    -- want to wait out the pause.
+    ensures: breaker.status = active
+    ensures: breaker.pause_count = 0
+    ensures: breaker.paused_until = null
+    ensures: RelayRequested()
+}
+
+rule AbandonAttemptAtRunLimit {
+    when: RunLimitReached(attempt, reason)
+
+    requires: attempt.status in {resolving, sending}
+    requires: attempt.run.is_running
+
+    let outbox = attempt.outbox
+
+    requires: outbox.status = pending
+
+    -- The budget check is meant to prevent this. It happens when a relay
+    -- client used more than it declared. The outbox is put back as it was:
+    -- the attempt is not counted, no error is recorded against it and no
+    -- wait is added. The run starts nothing more, and the next run takes
+    -- the outbox up again.
+    ensures: attempt.status = abandoned
+    ensures: outbox.relay_attempts = outbox.relay_attempts - 1
+
+    -- The delivery deadline may have passed while this attempt was under
+    -- way. Expiry waited for the attempt, so it happens now.
+    ensures:
+        if outbox.is_past_deadline:
+            outbox.status = expired
+            outbox.expired_at = now
+            outbox.retained_until = now + outbox.effective_retention
+
+    -- Reported so that the wrong declaration gets noticed.
+    ensures: ErrorReported(subscription: outbox.subscription, reason: reason)
+
+    @guidance
+        -- If the request had already gone out when the limit was reached,
+        -- the subscriber may have received the message. The next run sends
+        -- it again with the same idempotency key.
+}
+
+-- Reporting to the log adapter
+
+rule ReportSuccessfulAttempt {
+    when: attempt: RelayAttempt.status becomes succeeded
+    requires: attempt.outbox.subscription != null and attempt.outbox.subscription.has_log_adapter
+    ensures: AttemptReported(attempt: attempt)
+}
+
+rule ReportFailedAttempt {
+    -- Covers an attempt that failed while sending or resolving, and one
+    -- that failed at once because its configuration was missing.
+    when: attempt: RelayAttempt.status becomes failed
+
+    requires: attempt.outbox.subscription != null and attempt.outbox.subscription.has_log_adapter
+
+    ensures: AttemptReported(attempt: attempt)
+}
+
+rule ReportFailedAttemptToFallback {
+    -- An attempt whose subscription is missing is reported to the
+    -- application's fallback adapter, when the application names one.
+    -- Otherwise its only record is on the outbox.
+    when: attempt: RelayAttempt.status becomes failed
+
+    requires: attempt.outbox.subscription = null
+    requires: attempt.outbox.application.has_log_adapter
+
+    ensures: AttemptReported(attempt: attempt)
+}
+
+rule ReportAfterRelayActionFailure {
+    when: AfterRelayActionFailed(subscription, run, reason)
+
+    requires: subscription.has_log_adapter
+
+    -- The failure is reported and nothing else changes. The outcomes of
+    -- the run stand.
+    ensures: ErrorReported(subscription: subscription, reason: reason)
+}
+
+-- Finishing a relay run
+
+rule FinishRelayRun {
+    when: RelayRunEnded(run)
+
+    requires: run.status = running
+
+    ensures: run.status = finished
+    ensures:
+        for subscription in Subscriptions where has_after_relay_action:
+            if run.attempts.any(a => a.outbox.subscription = subscription):
+                AfterRelayActionRequested(subscription: subscription, run: run)
+    ensures:
+        if SubscriptionOutboxes.any(o => o.is_due):
+            RelayRequested()
+
+    @guidance
+        -- A run ends when every pending outbox has had its turn, when it
+        -- has made as many attempts as its size allows, when it has no room
+        -- left for another attempt, or when the platform cuts it short. In
+        -- every case the outcomes recorded so far are kept. A run that
+        -- stops because of its size or its budget ends normally, and the
+        -- next run takes up where it left off.
+}
+
+-- Operator corrections
+
+rule OperatorDeadLettersOutbox {
+    when: OperatorDeadLettersOutbox(operator, outbox)
+
+    requires: outbox.status = pending
+
+    -- The operator tries again once the attempt has finished.
+    requires: not outbox.has_attempt_in_progress
+
+    ensures: outbox.status = dead_lettered
+    ensures: outbox.manual_dead_letter = true
+}
+
+rule OperatorClearsManualDeadLetter {
+    when: OperatorClearsManualDeadLetter(operator, outbox)
+
+    requires: outbox.status = dead_lettered
+    requires: outbox.manual_dead_letter
+
+    -- The outbox becomes pending again only if it still has attempts left.
+    -- One that has also used up its attempts stays dead-lettered.
+    ensures: outbox.manual_dead_letter = false
+    ensures:
+        if outbox.relay_attempts < outbox.max_attempts:
+            outbox.status = pending
+}
+
+rule OperatorRaisesMaxAttempts {
+    when: OperatorRaisesMaxAttempts(operator, outbox, max_attempts)
+
+    requires: outbox.status = dead_lettered
+    requires: max_attempts > outbox.relay_attempts
+
+    -- The outbox becomes pending again unless an operator also set it
+    -- aside by hand.
+    ensures: outbox.max_attempts = max_attempts
+    ensures:
+        if not outbox.manual_dead_letter:
+            outbox.status = pending
+}
+
+rule OperatorRaisesMaxAttemptsInAdvance {
+    when: OperatorRaisesMaxAttemptsInAdvance(operator, outbox, max_attempts)
+
+    -- For an outbox that is still being attempted and should be given more
+    -- tries before it runs out.
+    requires: outbox.status = pending
+    requires: max_attempts > outbox.max_attempts
+
+    ensures: outbox.max_attempts = max_attempts
+}
+
+rule OperatorReattemptsDeadLetters {
+    when: OperatorReattemptsDeadLetters(operator, subscription)
+
+    -- Every dead-lettered outbox for the subscription is made pending
+    -- again in one step. Each gets a fresh allowance of attempts, the same
+    -- size as the subscription's maximum, and any wait is cleared.
+    for outbox in subscription.outboxes:
+        requires: outbox.status = dead_lettered
+        ensures: outbox.status = pending
+        ensures: outbox.max_attempts = outbox.relay_attempts + subscription.max_attempts
+        ensures: outbox.manual_dead_letter = false
+        ensures: outbox.next_attempt_at = null
+        ensures: RelayRequested()
+
+    @guidance
+        -- An outbox past its delivery deadline has already expired and is
+        -- not dead-lettered any more, so it is not picked up.
+}
+
+-- Skipping is written as two rules, one for each state an outbox can be
+-- skipped from, so that each move between states is stated outright.
+
+rule OperatorSkipsPendingOutbox {
+    when: OperatorSkipsOutbox(operator, outbox)
+
+    requires: outbox.status = pending
+
+    -- The operator tries again once the attempt has finished.
+    requires: not outbox.has_attempt_in_progress
+
+    -- The message is not relayed to this subscription. Later messages in
+    -- its group are no longer held back by it.
+    ensures: outbox.status = skipped
+    ensures: outbox.skipped_at = now
+    ensures: outbox.skipped_by = operator
+    ensures: outbox.retained_until = now + outbox.effective_retention
+}
+
+rule OperatorSkipsDeadLetteredOutbox {
+    when: OperatorSkipsOutbox(operator, outbox)
+
+    requires: outbox.status = dead_lettered
+
+    ensures: outbox.status = skipped
+    ensures: outbox.skipped_at = now
+    ensures: outbox.skipped_by = operator
+    ensures: outbox.retained_until = now + outbox.effective_retention
+}
+
+rule OperatorChangesRetentionEnd {
+    when: OperatorChangesRetentionEnd(operator, outbox, retained_until)
+
+    -- Only a settled outbox has a retention end. An operator who wants bad
+    -- records gone skips them and then brings this date forward.
+    requires: outbox.status in {completed, skipped, expired}
+
+    ensures: outbox.retained_until = retained_until
+}
+
+-- Cleanup
+
+-- Expiry applies to pending and dead-lettered outboxes alike. It is written
+-- as two rules, one for each state, so that each move is stated outright.
+--
+-- What happens once the delivery deadline has passed:
+--   - No new attempt starts.
+--   - An attempt already under way is allowed to finish. A success
+--     completes the outbox. A failure, or the attempt being abandoned,
+--     expires it.
+--   - Otherwise the outbox is marked expired the next time cleanup runs.
+--   - Until it is marked, it is still pending or dead-lettered, and every
+--     operator action for that state still applies. What an operator may
+--     do depends on the state the outbox is in, never on the clock. An
+--     outbox an operator revives after its deadline is not attempted, and
+--     is marked expired at the next cleanup.
+
+rule ExpirePendingOutbox {
+    when: ExpiryCheckDue(outbox)
+
+    requires: outbox.status = pending
+    requires: outbox.is_past_deadline
+
+    -- An outbox with an attempt under way expires when that attempt fails,
+    -- or is completed if it succeeds.
+    requires: not outbox.has_attempt_in_progress
+
+    -- The system gives up on the message for this subscription. The record
+    -- stays, marked as expired, until its retention period ends. Later
+    -- messages in its group are no longer held back.
+    ensures: outbox.status = expired
+    ensures: outbox.expired_at = now
+    ensures: outbox.retained_until = now + outbox.effective_retention
+}
+
+rule ExpireDeadLetteredOutbox {
+    when: ExpiryCheckDue(outbox)
+
+    requires: outbox.status = dead_lettered
+    requires: outbox.is_past_deadline
+
+    ensures: outbox.status = expired
+    ensures: outbox.expired_at = now
+    ensures: outbox.retained_until = now + outbox.effective_retention
+}
+
+rule RemoveOutboxAfterRetention {
+    when: outbox: SubscriptionOutbox.retained_until <= now
+
+    -- Retention only starts once an outbox is settled, so an undelivered
+    -- outbox is never removed by cleanup.
+    requires: outbox.status in {completed, skipped, expired}
+
+    ensures: not exists outbox
+
+    @guidance
+        -- Removal can lag the end of retention by up to the interval at
+        -- which cleanup is scheduled.
+}
+
+rule RemoveDrainedMessage {
+    when: message: OutboxMessage.is_drained
+
+    requires: message.definition.delete_when_outbox_empty
+
+    ensures: not exists message
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant OneRelayRunAtATime {
+    for a in RelayRuns:
+        for b in RelayRuns:
+            a != b implies not (a.status = running and b.status = running)
+}
+
+invariant CompletedOnlyAfterSuccess {
+    for outbox in SubscriptionOutboxes:
+        outbox.status = completed implies outbox.attempts.any(a => a.status = succeeded)
+}
+
+invariant IdempotencyKeysAreUnique {
+    for a in SubscriptionOutboxes:
+        for b in SubscriptionOutboxes:
+            a != b implies a.idempotency_key != b.idempotency_key
+}
+
+invariant OneOutboxPerSubscription {
+    for a in SubscriptionOutboxes:
+        for b in SubscriptionOutboxes:
+            a != b and a.message = b.message implies a.subscription != b.subscription
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor Operator {
+    identified_by: User where is_outbox_admin
+}
+
+-- The parties below are code or other systems, not people.
+
+actor Publisher {
+    identified_by: PublishingProcess
+}
+
+actor Scheduler {
+    identified_by: SchedulingService
+}
+
+actor InstalledRelayClient {
+    identified_by: RelayClientImplementation
+}
+
+actor InstalledMessageResolver {
+    identified_by: MessageResolverImplementation
+}
+
+actor InstalledAfterRelayAction {
+    identified_by: AfterRelayActionImplementation
+}
+
+actor InstalledLogAdapter {
+    identified_by: LogAdapterImplementation
+}
+
+actor ReceivingSystem {
+    identified_by: Application
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface Publishing {
+    facing _: Publisher
+
+    provides:
+        PublishMessage(message_type, payload, group_id?)
+
+    @guarantee PublishedWithTheDomainChange
+        -- A message and its outboxes are recorded in the same transaction as
+        -- the publisher's own changes. Either all of it is kept or none of
+        -- it is, so a committed change cannot lose its message.
+
+    @guarantee AtLeastOnceDelivery
+        -- Every outbox is attempted until its subscriber accepts the message,
+        -- the outbox is dead-lettered, an operator skips it, or it expires. An outbox counts as
+        -- delivered only after its relay client reports success. If a run is
+        -- cut short before an outcome is recorded, the outbox stays pending
+        -- and is attempted again, so a subscriber can receive the same
+        -- message more than once. Every attempt carries the outbox's
+        -- idempotency key, which lets the subscriber discard a repeat.
+
+    @guarantee GroupOrder
+        -- Within a group, a subscription never receives a message before
+        -- every earlier message in that group has been delivered to it,
+        -- skipped or expired. An application can extend this across all of
+        -- its subscriptions, so that one subscription's undelivered message
+        -- holds back the others for that group.
+
+    @guarantee OnlyEarlierMessagesHold
+        -- A message is held only by a message published before it in its
+        -- group. It is never held by one published after it. Where order is
+        -- shared across an application's subscriptions, it is never held by
+        -- another subscription's outbox for the same message. So when one
+        -- subscriber cannot take a message, the application's other
+        -- subscribers still receive that message, and wait only for what
+        -- comes after it.
+
+    @guarantee HeldOutboxesNeverStrandOthers
+        -- An outbox that cannot be attempted never stops one that can.
+        -- However many held outboxes were published before it, an outbox
+        -- that is due is attempted within a bounded number of relay runs.
+        -- A run that looks only at the oldest outboxes, and so can find
+        -- nothing but held ones, does not meet this.
+}
+
+surface RelaySchedule {
+    facing _: Scheduler
+
+    provides:
+        RelaySweepDue()
+        RelayRunEnded(run)
+        RunLimitReached(attempt, reason)
+        ExpiryCheckDue(outbox)
+
+    @guarantee ExpiryIsCheckedByCleanup
+        -- Cleanup looks at every outbox that is not settled and raises the
+        -- expiry check for it. An outbox can be marked expired up to one
+        -- cleanup interval after its delivery deadline. An operator can
+        -- still act on it during that time.
+
+    @guarantee SchedulesAreSetAtActivation
+        -- The framework can be installed without being activated.
+        -- Scheduling the sweep and cleanup is part of activating it. The
+        -- team that puts the framework into use does that, chooses how
+        -- often each runs, and checks that both are in place. The framework
+        -- holds no setting for either interval and does not check for
+        -- them. Until the sweep is scheduled, a relay run starts only when
+        -- a message is published, a run hands over to the next, or an
+        -- operator asks. Until cleanup is scheduled, no outbox is marked
+        -- expired and no record is removed.
+}
+
+surface OutboxReview {
+    facing operator: Operator
+
+    context outbox: SubscriptionOutbox
+
+    exposes:
+        outbox.idempotency_key
+        outbox.message.payload
+        outbox.message.group_id
+        outbox.relay_attempts
+        outbox.max_attempts
+        outbox.status
+        outbox.manual_dead_letter
+        outbox.last_attempt_at
+        outbox.next_attempt_at
+        outbox.completed_at when outbox.status = completed
+        outbox.skipped_at when outbox.status = skipped
+        outbox.skipped_by when outbox.status = skipped
+        outbox.expired_at when outbox.status = expired
+        outbox.retained_until when outbox.status in {completed, skipped, expired}
+        outbox.last_error
+        outbox.log
+        outbox.delivery_deadline
+
+    provides:
+        OperatorDeadLettersOutbox(operator, outbox) when outbox.status = pending
+        OperatorClearsManualDeadLetter(operator, outbox) when outbox.status = dead_lettered
+        OperatorRaisesMaxAttempts(operator, outbox, max_attempts) when outbox.status = dead_lettered
+        OperatorRaisesMaxAttemptsInAdvance(operator, outbox, max_attempts) when outbox.status = pending
+        OperatorSkipsOutbox(operator, outbox) when outbox.status in {pending, dead_lettered}
+        OperatorChangesRetentionEnd(operator, outbox, retained_until)
+            when outbox.status in {completed, skipped, expired}
+        OperatorRequestsRelay(operator)
+
+    @guarantee OversizedTextNeverBlocksTheOutcome
+        -- An error or log too long to store is shortened. It never prevents
+        -- the outcome of an attempt being recorded.
+
+    @guarantee NoDeletion
+        -- Nobody can delete an outbox. A record leaves only when its
+        -- retention period ends, and only after it is delivered, skipped
+        -- or expired, so every outbox that is gone had a recorded outcome
+        -- first.
+}
+
+surface SubscriptionReview {
+    facing operator: Operator
+
+    context subscription: Subscription
+
+    provides:
+        OperatorReattemptsDeadLetters(operator, subscription)
+        OperatorRestartsSubscription(operator, subscription)
+        OperatorEndsPause(operator, subscription)
+
+    @guarantee PausedAndStoppedSubscriptionsAreVisible
+        -- An operator can see whether a subscription is being sent to, is
+        -- paused and until when, or is stopped, and how many times in a row
+        -- it has been paused.
+}
+
+surface RelayClientIntegration {
+    facing _: InstalledRelayClient
+
+    contracts:
+        demands RelayClient
+
+    @guarantee SettingsValidatedInAcceptanceTests
+        -- An acceptance test goes through every subscription and passes its
+        -- client settings to validate_settings on the relay client it
+        -- names. The test fails if any client rejects its settings, or if
+        -- a subscription names something that is not a relay client.
+
+    provides:
+        RelaySucceeded(attempt)
+        RelayFailed(attempt, reason)
+        SubscriptionPauseRequested(attempt)
+}
+
+surface MessageResolverIntegration {
+    facing _: InstalledMessageResolver
+
+    contracts:
+        demands MessageResolver
+
+    @guarantee ResolverNameCheckedInAcceptanceTests
+        -- An acceptance test goes through every message definition that
+        -- names a resolver. The test fails if the name does not lead to a
+        -- message resolver.
+
+    provides:
+        MessageResolved(attempt, resolved_payload)
+        MessageResolutionFailed(attempt, reason)
+}
+
+surface AfterRelayActionIntegration {
+    facing _: InstalledAfterRelayAction
+
+    contracts:
+        demands AfterRelayAction
+
+    provides:
+        AfterRelayActionFailed(subscription, run, reason)
+
+    @guarantee ActionNameCheckedInAcceptanceTests
+        -- An acceptance test goes through every subscription that names an
+        -- after-relay action. The test fails if the name does not lead to
+        -- an after-relay action.
+}
+
+surface LoggingIntegration {
+    facing _: InstalledLogAdapter
+
+    contracts:
+        demands LogAdapter
+
+    @guarantee NamedBySubscription
+        -- The framework defines what a log adapter must do. The team that
+        -- installs the framework writes the adapter. Each subscription
+        -- names the adapter it reports to, so different endpoints can log
+        -- in different ways.
+
+    @guarantee WorksWithoutAnAdapter
+        -- A subscription that names no adapter is relayed as normal. The
+        -- only record is then what each of its outboxes holds about its
+        -- latest attempt. Errors for it are not reported to anyone, so a
+        -- stopped subscription is only found by looking.
+
+    @guarantee FallbackOnTheApplication
+        -- An application can name a fallback adapter. It receives reports
+        -- for the application's outboxes whose subscription is missing.
+
+    @guarantee AdapterNameCheckedInAcceptanceTests
+        -- An acceptance test goes through every subscription and every
+        -- application that names a log adapter. The test fails if a name
+        -- does not lead to a log adapter.
+}
+
+surface SubscriberObligations {
+    facing _: ReceivingSystem
+
+    contracts:
+        demands Subscriber
+
+    @guarantee DuplicatesAreTheSubscribersToHandle
+        -- The framework delivers at least once and gives every delivery a
+        -- stable idempotency key. It does not promise exactly once.
+        -- Recognising and discarding a repeat is required of the receiving
+        -- system, and the framework cannot check that it does so.
+}
