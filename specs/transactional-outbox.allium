@@ -1008,10 +1008,6 @@ rule OperatorDeadLettersOutbox {
 
     requires: outbox.status = pending
 
-    -- Once the delivery deadline has passed, the outbox expires. Nothing
-    -- else is done to it.
-    requires: not outbox.is_past_deadline
-
     -- The operator tries again once the attempt has finished.
     requires: not outbox.has_attempt_in_progress
 
@@ -1024,7 +1020,6 @@ rule OperatorClearsManualDeadLetter {
 
     requires: outbox.status = dead_lettered
     requires: outbox.manual_dead_letter
-    requires: not outbox.is_past_deadline
 
     -- The outbox becomes pending again only if it still has attempts left.
     -- One that has also used up its attempts stays dead-lettered.
@@ -1039,7 +1034,6 @@ rule OperatorRaisesMaxAttempts {
 
     requires: outbox.status = dead_lettered
     requires: max_attempts > outbox.relay_attempts
-    requires: not outbox.is_past_deadline
 
     -- The outbox becomes pending again unless an operator also set it
     -- aside by hand.
@@ -1056,7 +1050,6 @@ rule OperatorRaisesMaxAttemptsInAdvance {
     -- tries before it runs out.
     requires: outbox.status = pending
     requires: max_attempts > outbox.max_attempts
-    requires: not outbox.is_past_deadline
 
     ensures: outbox.max_attempts = max_attempts
 }
@@ -1069,7 +1062,6 @@ rule OperatorReattemptsDeadLetters {
     -- size as the subscription's maximum, and any wait is cleared.
     for outbox in subscription.outboxes:
         requires: outbox.status = dead_lettered
-        requires: not outbox.is_past_deadline
         ensures: outbox.status = pending
         ensures: outbox.max_attempts = outbox.relay_attempts + subscription.max_attempts
         ensures: outbox.manual_dead_letter = false
@@ -1088,7 +1080,6 @@ rule OperatorSkipsPendingOutbox {
     when: OperatorSkipsOutbox(operator, outbox)
 
     requires: outbox.status = pending
-    requires: not outbox.is_past_deadline
 
     -- The operator tries again once the attempt has finished.
     requires: not outbox.has_attempt_in_progress
@@ -1105,7 +1096,6 @@ rule OperatorSkipsDeadLetteredOutbox {
     when: OperatorSkipsOutbox(operator, outbox)
 
     requires: outbox.status = dead_lettered
-    requires: not outbox.is_past_deadline
 
     ensures: outbox.status = skipped
     ensures: outbox.skipped_at = now
@@ -1128,17 +1118,23 @@ rule OperatorChangesRetentionEnd {
 -- Expiry applies to pending and dead-lettered outboxes alike. It is written
 -- as two rules, one for each state, so that each move is stated outright.
 --
--- What happens at the delivery deadline:
+-- What happens once the delivery deadline has passed:
+--   - No new attempt starts.
 --   - An attempt already under way is allowed to finish. A success
 --     completes the outbox. A failure, or the attempt being abandoned,
 --     expires it.
---   - Otherwise the outbox expires. No new attempt starts and no operator
---     action applies once the deadline has passed.
+--   - Otherwise the outbox is marked expired the next time cleanup runs.
+--   - Until it is marked, it is still pending or dead-lettered, and every
+--     operator action for that state still applies. What an operator may
+--     do depends on the state the outbox is in, never on the clock. An
+--     outbox an operator revives after its deadline is not attempted, and
+--     is marked expired at the next cleanup.
 
 rule ExpirePendingOutbox {
-    when: outbox: SubscriptionOutbox.delivery_deadline <= now
+    when: ExpiryCheckDue(outbox)
 
     requires: outbox.status = pending
+    requires: outbox.is_past_deadline
 
     -- An outbox with an attempt under way expires when that attempt fails,
     -- or is completed if it succeeds.
@@ -1153,9 +1149,10 @@ rule ExpirePendingOutbox {
 }
 
 rule ExpireDeadLetteredOutbox {
-    when: outbox: SubscriptionOutbox.delivery_deadline <= now
+    when: ExpiryCheckDue(outbox)
 
     requires: outbox.status = dead_lettered
+    requires: outbox.is_past_deadline
 
     ensures: outbox.status = expired
     ensures: outbox.expired_at = now
@@ -1304,6 +1301,12 @@ surface RelaySchedule {
         RelaySweepDue()
         RelayRunEnded(run)
         RunLimitReached(attempt, reason)
+        ExpiryCheckDue(outbox)
+
+    @guarantee ExpiryIsCheckedByCleanup
+        -- Cleanup looks at every outbox that is not settled and raises the
+        -- expiry check for it. Cleanup runs every hour, so an outbox can be
+        -- marked expired up to that long after its delivery deadline.
 
     @guarantee SweepIsSetUpAtActivation
         -- The framework can be installed without being activated. Setting
@@ -1347,10 +1350,6 @@ surface OutboxReview {
         OperatorChangesRetentionEnd(operator, outbox, retained_until)
             when outbox.status in {completed, skipped, expired}
         OperatorRequestsRelay(operator)
-
-    timeout:
-        ExpirePendingOutbox
-        ExpireDeadLetteredOutbox
 
     @guarantee OversizedTextNeverBlocksTheOutcome
         -- An error or log too long to store is shortened. It never prevents
