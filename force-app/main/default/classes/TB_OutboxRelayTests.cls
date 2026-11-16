@@ -903,10 +903,10 @@ public class TB_OutboxRelayTests {
         return message;
     }
 
-    static void makeFirstOutboxWaitOnBackoff() {
-        TB_Subscription_Outbox__c first = outboxesInOrder()[0];
-        first.Next_Attempt_Timestamp__c = System.now().addMinutes(30);
-        update first;
+    static void makeOutboxWaitOnBackoff(Integer position) {
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[position];
+        outbox.Next_Attempt_Timestamp__c = System.now().addMinutes(30);
+        update outbox;
     }
 
     static List<Integer> attemptsInOrder() {
@@ -966,7 +966,7 @@ public class TB_OutboxRelayTests {
             newMessage(msgDef),
             newMessage(msgDef)
         };
-        makeFirstOutboxWaitOnBackoff();
+        makeOutboxWaitOnBackoff(0);
         Test.stopTest();
 
         System.assertEquals(
@@ -997,7 +997,7 @@ public class TB_OutboxRelayTests {
             newMessage(msgDef),
             newMessage(msgDef)
         };
-        makeFirstOutboxWaitOnBackoff();
+        makeOutboxWaitOnBackoff(0);
         Test.stopTest();
 
         System.assertEquals(
@@ -1063,11 +1063,57 @@ public class TB_OutboxRelayTests {
             newMessage(msgDef),
             newMessage(msgDef)
         };
-        makeFirstOutboxWaitOnBackoff();
+        makeOutboxWaitOnBackoff(0);
         TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
         Test.stopTest();
 
         System.assertEquals(2, relayJobCount(), 'The ungrouped outbox the first run left should start a second run');
         System.assertEquals(new List<Integer>{ 0, 0, 1, 1 }, attemptsInOrder());
+    }
+
+    @isTest
+    static void testLaterMessageDoesNotHoldAnEarlierOneInItsGroup() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1')
+        };
+        makeOutboxWaitOnBackoff(1);
+        Test.stopTest();
+
+        System.assertEquals(
+            new List<Integer>{ 1, 0, 0 },
+            attemptsInOrder(),
+            'The first message should go. The second is waiting, and it holds only the third'
+        );
+    }
+
+    /**
+     * Group order is shared by an application's subscriptions. When one subscription cannot take a message,
+     * the others still get that message, and every subscription waits for the messages after it.
+     */
+    @isTest
+    static void testFailureDoesNotHoldAnotherSubscriptionsOutboxForTheSameMessage() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1').Config__c = '{"throwError":true}';
+        addTestClientSubscription(app, msgDef, 'subscription2');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1')
+        };
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1, 0, 0 }, attemptsInOrder());
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'subscription1 should fail the first message');
+        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'subscription2 should still get the first message');
     }
 }

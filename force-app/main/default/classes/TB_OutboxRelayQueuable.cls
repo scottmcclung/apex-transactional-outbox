@@ -157,12 +157,12 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     private static final Integer MAX_SCAN_PAGES = 10;
   
     /**
-     * Chooses the outboxes this run will attempt: the oldest due outboxes whose group is not held,
+     * Chooses the outboxes this run will attempt: the oldest due outboxes that are not held,
      * up to the batch size. Everything else is left for a later run.
      *
      * Due outboxes are read a page at a time in publish order, with small fields and no lock.
-     * Groups found to be held are added to the holds, and later pages leave them out,
-     * so a long held group does not use up the pages. Only the chosen outboxes are then
+     * Holds found on the way are recorded, and later pages leave out a group once the search
+     * has passed the message holding it, so a long held group does not use up the pages. Only the chosen outboxes are then
      * loaded with their payloads and locked.
      *
      * The search gives up after MAX_SCAN_PAGES pages. If more distinct held groups than that
@@ -175,6 +175,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       Integer pageSize = batchSize * 2;
       List<Id> chosenIds = new List<Id>();
       TB_Subscription_Outbox__c lastSeen = null;
+      Set<String> checkedGroupIds = new Set<String>();
   
       for (
         Integer page = 0;
@@ -184,9 +185,9 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         List<TB_Subscription_Outbox__c> candidates = loadDuePage(
           pageSize,
           lastSeen,
-          holds.heldGroupIds()
+          holds
         );
-        holds.holdGroups(findHeldGroupIds(candidates, holds));
+        findBlockedMembers(candidates, checkedGroupIds, holds);
   
         for (TB_Subscription_Outbox__c candidate : candidates) {
           if (chosenIds.size() < batchSize && !holds.isHeld(candidate)) {
@@ -211,7 +212,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     private List<TB_Subscription_Outbox__c> loadDuePage(
       Integer pageSize,
       TB_Subscription_Outbox__c lastSeen,
-      Set<String> heldGroupIds
+      GroupHolds holds
     ) {
       if (lastSeen == null) {
         return [
@@ -229,6 +230,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
       String lastSequence = lastSeen.Outbox_Message__r.Sequence_Number__c;
       Id lastId = lastSeen.Id;
+      Set<String> heldGroupIds = holds.groupIdsHeldBefore(lastSeen);
       return [
         SELECT Id, Group_Id__c, Outbox_Message__r.Sequence_Number__c
         FROM TB_Subscription_Outbox__c
@@ -247,36 +249,35 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     }
   
     /**
-     * Of the groups these outboxes belong to, the ones that are held and not yet known to be:
-     * those with an outbox that is dead-lettered or still waiting on its backoff.
-     * We cannot continue processing the rest of such a group until that is resolved.
+     * Records a hold for each outbox that is dead-lettered or still waiting on its backoff
+     * in the groups these outboxes belong to. The rest of such a group, from that message on,
+     * cannot be processed until it is resolved. Each group is looked up once per run.
      */
-    private Set<String> findHeldGroupIds(
+    private void findBlockedMembers(
       List<TB_Subscription_Outbox__c> outboxRecords,
+      Set<String> checkedGroupIds,
       GroupHolds holds
     ) {
-      Set<String> unknownGroupIds = new Set<String>();
+      Set<String> uncheckedGroupIds = new Set<String>();
       for (TB_Subscription_Outbox__c item : outboxRecords) {
-        if (item.Group_Id__c != null && !holds.isHeld(item)) {
-          unknownGroupIds.add(item.Group_Id__c);
+        if (item.Group_Id__c != null && !checkedGroupIds.contains(item.Group_Id__c)) {
+          uncheckedGroupIds.add(item.Group_Id__c);
         }
       }
   
-      Set<String> heldGroupIds = new Set<String>();
-      if (unknownGroupIds.size() > 0) {
-        for (TB_Subscription_Outbox__c item : [
-          SELECT Group_Id__c
+      if (uncheckedGroupIds.size() > 0) {
+        for (TB_Subscription_Outbox__c blocked : [
+          SELECT Group_Id__c, Outbox_Message__r.Sequence_Number__c
           FROM TB_Subscription_Outbox__c
           WHERE
             (Dead_Lettered__c = TRUE
             OR Next_Attempt_Timestamp__c > :executeStart)
-            AND Group_Id__c IN :unknownGroupIds
+            AND Group_Id__c IN :uncheckedGroupIds
         ]) {
-          heldGroupIds.add(item.Group_Id__c);
+          holds.hold(blocked);
         }
+        checkedGroupIds.addAll(uncheckedGroupIds);
       }
-  
-      return heldGroupIds;
     }
   
     /**
@@ -321,31 +322,60 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     }
   
     /**
-     * The message groups this run must not attempt.
-     * The rest of a group cannot be processed once one of its outboxes is dead-lettered,
-     * has a next attempt time still to come, failed in this run, or was passed over in this run.
-     * The finalizer reads the same holds when it decides whether to queue another run.
+     * Which outboxes this run must not attempt because of their message group.
+     *
+     * An outbox holds the messages published after it in its group when it is dead-lettered,
+     * waiting on a backoff, failed in this run, or passed over in this run. It never holds a message
+     * published before it, and never another subscription's outbox for the same message.
+     * Group order is shared by all of an application's subscriptions.
+     *
+     * The finalizer reads the held groups when it decides whether to queue another run.
      */
     private class GroupHolds {
-      private Set<String> groupIds = new Set<String>();
+      // For each held group, the lowest sequence number of an outbox holding it.
+      private Map<String, Long> heldFromSequence = new Map<String, Long>();
   
       public Boolean isHeld(TB_Subscription_Outbox__c item) {
-        return item.Group_Id__c != null && groupIds.contains(item.Group_Id__c);
+        if (item.Group_Id__c == null) {
+          return false;
+        }
+        Long heldFrom = heldFromSequence.get(item.Group_Id__c);
+        return heldFrom != null && heldFrom < sequenceOf(item);
       }
   
-      /** An outbox with no group holds nothing. */
+      /** Holds the messages after this outbox in its group. An outbox with no group holds nothing. */
       public void hold(TB_Subscription_Outbox__c item) {
-        if (item.Group_Id__c != null) {
-          groupIds.add(item.Group_Id__c);
+        if (item.Group_Id__c == null) {
+          return;
+        }
+        Long heldFrom = heldFromSequence.get(item.Group_Id__c);
+        Long sequence = sequenceOf(item);
+        if (heldFrom == null || sequence < heldFrom) {
+          heldFromSequence.put(item.Group_Id__c, sequence);
         }
       }
   
-      public void holdGroups(Set<String> heldGroupIds) {
-        groupIds.addAll(heldGroupIds);
+      public Set<String> heldGroupIds() {
+        return heldFromSequence.keySet().clone();
       }
   
-      public Set<String> heldGroupIds() {
+      /**
+       * The groups held by a message published before this outbox's message.
+       * Everything after this outbox in publish order is held in those groups.
+       */
+      public Set<String> groupIdsHeldBefore(TB_Subscription_Outbox__c item) {
+        Long sequence = sequenceOf(item);
+        Set<String> groupIds = new Set<String>();
+        for (String groupId : heldFromSequence.keySet()) {
+          if (heldFromSequence.get(groupId) < sequence) {
+            groupIds.add(groupId);
+          }
+        }
         return groupIds;
+      }
+  
+      private Long sequenceOf(TB_Subscription_Outbox__c item) {
+        return Long.valueOf(item.Outbox_Message__r.Sequence_Number__c);
       }
     }
   
