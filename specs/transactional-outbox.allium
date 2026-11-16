@@ -124,12 +124,32 @@ external entity Subscription {
 }
 
 ------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- What one send is expected to use of the limits a relay run works within.
+-- A relay client states this for each subscription, so the run can tell
+-- whether there is room for another attempt before it starts one.
+value SendCost {
+    callouts: Integer
+    callout_time: Duration
+    queries: Integer
+    query_rows: Integer
+    write_statements: Integer
+    write_rows: Integer
+    event_publishes: Integer
+    processing_time: Duration
+    memory: Integer
+}
+
+------------------------------------------------------------
 -- Contracts
 ------------------------------------------------------------
 
 contract RelayClient {
     send: (attempt: RelayAttempt) -> Boolean
     validate_settings: (settings: ClientSettings?) -> Boolean
+    cost_of_send: (subscription: Subscription) -> SendCost
 
     @invariant FailureIsExplicit
         -- The client must signal failure when the subscriber did not take
@@ -149,6 +169,20 @@ contract RelayClient {
         -- Settings that validate_settings would reject also fail a send.
         -- They fail that one attempt. They never stop the relay run or
         -- affect other outboxes.
+
+    @invariant DeclaresTheCostOfOneSend
+        -- cost_of_send states the most that one send for the subscription
+        -- will use: outbound calls and the time they may take, queries and
+        -- the rows they return, writes, event publishes, processing time
+        -- and memory. A client that looks up records before sending counts
+        -- those queries here.
+
+    @invariant MayPauseItsSubscription
+        -- During a send the client may ask the framework to stop sending to
+        -- its subscription until a given time, for example when the
+        -- subscriber says it is being sent too much. The subscription's
+        -- other outboxes are then left alone until that time and are not
+        -- charged an attempt.
 
     @invariant PassesTheIdempotencyKey
         -- The client gives the subscriber the outbox's idempotency key with
@@ -369,7 +403,14 @@ entity SubscriptionOutbox {
     has_attempt_in_progress:
         attempts.any(a => a.status in {resolving, sending} and a.run.is_running)
 
-    is_due: is_pending and not is_past_deadline and not is_backing_off and not is_held_by_group
+    -- A relay client has asked for this outbox's subscription to be left
+    -- alone, and that time has not passed.
+    is_subscription_paused:
+        SubscriptionPauses.any(p => p.subscription = subscription and p.is_in_force)
+
+    is_due:
+        is_pending and not is_past_deadline and not is_backing_off
+        and not is_held_by_group and not is_subscription_paused
 
     has_configuration: subscription != null and message.definition != null
 
@@ -435,6 +476,7 @@ entity RelayAttempt {
     requested_next_attempt_at: Timestamp?
     requested_delivery_deadline: Timestamp?
     requested_retention: Duration?
+    requested_pause_until: Timestamp?
 
     transitions status {
         resolving -> sending
@@ -445,6 +487,14 @@ entity RelayAttempt {
     }
 }
 
+-- A relay client's request to leave a subscription alone for a while.
+entity SubscriptionPause {
+    subscription: Subscription
+    paused_until: Timestamp
+
+    is_in_force: paused_until > now
+}
+
 ------------------------------------------------------------
 -- Config
 ------------------------------------------------------------
@@ -453,6 +503,11 @@ config {
     -- The wait between attempts when the subscription is missing and the
     -- outbox has no copy of its backoff.
     fallback_retry_wait: Duration = 12.hours
+
+    -- The most attempts one relay run makes. An organisation changes this
+    -- to suit its scale. A run can stop sooner when it runs short of
+    -- budget, and never goes past this.
+    relay_run_size: Integer = 100
 }
 
 ------------------------------------------------------------
@@ -539,6 +594,18 @@ rule BeginRelayAttempt {
     requires: outbox.is_due
     requires: outbox.has_configuration
 
+    -- A run makes no more attempts than its size allows.
+    requires: run.attempts.count < config.relay_run_size
+
+    -- An attempt starts only when the run has room for what the relay
+    -- client says one send needs. has_budget_for compares that cost with
+    -- what is left of every limit the run works within: outbound calls,
+    -- total time spent on outbound calls, queries, rows returned by
+    -- queries, writes, event publishes, processing time and memory.
+    -- An outbox that is passed over for lack of room is not attempted, so
+    -- it is not charged an attempt. It waits for the next run.
+    requires: has_budget_for(run, cost_of_send(outbox.subscription))
+
     -- An isolated outbox is only attempted as the first attempt of a run,
     -- and the run attempts nothing else after it.
     requires: not outbox.subscription.isolate_relay or run.attempts.count = 0
@@ -561,6 +628,7 @@ rule FailAttemptWithoutConfiguration {
     requires: run.status = running
     requires: outbox.is_due
     requires: not outbox.has_configuration
+    requires: run.attempts.count < config.relay_run_size
 
     -- The attempt counts and leaves a record, so an operator can see why
     -- the outbox is not being delivered. It is retried like any failure,
@@ -619,6 +687,9 @@ rule RecordRelaySuccess {
 
     ensures: attempt.status = succeeded
     ensures: outbox.completed_at = now
+    ensures:
+        if attempt.requested_pause_until != null:
+            SubscriptionPause.created(subscription: outbox.subscription, paused_until: attempt.requested_pause_until)
     ensures: outbox.retention_override = attempt.requested_retention ?? outbox.retention_override
     ensures: outbox.retained_until =
         now + (attempt.requested_retention ?? outbox.effective_retention)
@@ -634,6 +705,10 @@ rule RecordRelayFailure {
 
     ensures: attempt.status = failed
     ensures: outbox.last_error = reason
+
+    ensures:
+        if attempt.requested_pause_until != null:
+            SubscriptionPause.created(subscription: outbox.subscription, paused_until: attempt.requested_pause_until)
 
     -- Changes the client asked for are kept even though the send failed.
     ensures: outbox.delivery_deadline = attempt.requested_delivery_deadline ?? outbox.delivery_deadline
@@ -715,9 +790,12 @@ rule FinishRelayRun {
             RelayRequested()
 
     @guidance
-        -- A run ends when every pending outbox has had its turn, or when the
-        -- platform cuts the run short. Either way the outcomes recorded so
-        -- far are kept.
+        -- A run ends when every pending outbox has had its turn, when it
+        -- has made as many attempts as its size allows, when it has no room
+        -- left for another attempt, or when the platform cuts it short. In
+        -- every case the outcomes recorded so far are kept. A run that
+        -- stops because of its size or its budget ends normally, and the
+        -- next run takes up where it left off.
 }
 
 -- Operator corrections

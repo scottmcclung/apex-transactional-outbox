@@ -242,6 +242,12 @@ surface RelayRequests {
         -- request. Settings it cannot use fail the attempt without
         -- contacting the subscriber.
 
+    @guarantee DeclaredCostOfOneSend
+        -- This client states the cost of one send as one outbound call
+        -- lasting up to the subscription's timeout, with no queries, no
+        -- writes and no event publishes. The framework uses that to decide
+        -- whether a relay run has room for another attempt.
+
     @guarantee ValidationMatchesSending
         -- validate_settings rejects exactly the settings that would fail
         -- this check: a missing or malformed endpoint, a missing or
