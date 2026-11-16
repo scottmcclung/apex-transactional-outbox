@@ -209,8 +209,11 @@ contract RelayClient {
         -- Record state belongs in the message resolver, which is called once
         -- for all the messages of a type. Subscribers that need different
         -- data about the same event are given separate message definitions,
-        -- each with its own resolver. A client may reshape what the resolver
-        -- returned, as long as it does so without further lookups.
+        -- each with its own resolver.
+        --
+        -- Deciding what a message contains is the message definition's job
+        -- and its resolver's. A relay client delivers what it is given. It
+        -- should not take on shaping the message for its subscriber.
 }
 
 -- What the framework requires of any system that receives messages,
