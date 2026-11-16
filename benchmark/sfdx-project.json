@@ -1,0 +1,10 @@
+{
+    "packageDirectories": [
+        {
+            "path": "fixtures",
+            "default": true
+        }
+    ],
+    "namespace": "",
+    "sourceApiVersion": "55.0"
+}

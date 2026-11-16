@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
+    <label>Repro Access</label>
+    <hasActivationRequired>false</hasActivationRequired>
+    <fieldPermissions><editable>true</editable><field>TB_Subscription_Outbox__c.TTL__c</field><readable>true</readable></fieldPermissions>
+    <fieldPermissions><editable>false</editable><field>TB_Subscription_Outbox__c.Dead_Lettered__c</field><readable>true</readable></fieldPermissions>
+    <fieldPermissions><editable>false</editable><field>TB_Subscription_Outbox__c.Group_Id__c</field><readable>true</readable></fieldPermissions>
+</PermissionSet>
