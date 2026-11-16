@@ -39,10 +39,9 @@ public class TB_OutboxRelayContext {
         this.subscription = subscription;
         this.subscriptionConfig = TB_OutboxMetadataProvider.getSubscriptionConfig(subscription);
 
-        //TODO: Should this always reset? Or should we truncate the oldest lines? (split on \n & reverse before saving)
-        if (this.outbox.Log__c == null) {
-            this.outbox.Log__c = '';
-        }
+        // The log holds what was written during the most recent attempt only, so it starts empty.
+        // The outbox is loaded without its stored log.
+        this.outbox.Log__c = '';
         if (this.outbox.Relay_Attempts__c == null) {
             this.outbox.Relay_Attempts__c = 0;
         }

@@ -1116,4 +1116,20 @@ public class TB_OutboxRelayTests {
         System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'subscription1 should fail the first message');
         System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'subscription2 should still get the first message');
     }
+
+    @isTest
+    static void testLogHoldsOnlyTheMostRecentAttempt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1').Config__c = '{"throwError":true, "log": "hello"}';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = [SELECT Relay_Attempts__c, Log__c FROM TB_Subscription_Outbox__c];
+        System.assertEquals(2, outbox.Relay_Attempts__c, 'The outbox should have been attempted twice');
+        System.assertEquals(1, outbox.Log__c.countMatches('hello'), 'The log should hold the second attempt only: ' + outbox.Log__c);
+    }
 }

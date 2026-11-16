@@ -295,7 +295,6 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
             Outbox_Message__r.Sequence_Number__c,
             Outbox_Message__r.Message__c,
             Outbox_Message__r.Type__c,
-            Log__c,
             Last_Error_Message__c,
             Relay_Attempts__c,
             Completed_Timestamp__c,
