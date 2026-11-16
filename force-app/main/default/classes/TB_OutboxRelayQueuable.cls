@@ -10,30 +10,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     public void execute(QueueableContext ctx) {
       executeStart = System.now();
   
-      // Checkout outbox records with Lock.
-      // NOTE: This lock will be released as soon as the first HTTP callout is made :(
-      List<TB_Subscription_Outbox__c> outboxRecordsUnsorted = [
-        SELECT
-          Subscription__c,
-          Group_Id__c,
-          Outbox_Message__c,
-          Outbox_Message__r.Sequence_Number__c,
-          Outbox_Message__r.Message__c,
-          Outbox_Message__r.Type__c,
-          Log__c,
-          Last_Error_Message__c,
-          Relay_Attempts__c,
-          Completed_Timestamp__c,
-          Next_Attempt_Timestamp__c,
-          TTL__c
-        FROM TB_Subscription_Outbox__c
-        WHERE
-          Completed_Timestamp__c = NULL
-          AND Dead_Lettered__c = FALSE
-          AND (Next_Attempt_Timestamp__c <= :executeStart
-          OR Next_Attempt_Timestamp__c = NULL)
-        FOR UPDATE
-      ];
+      List<TB_Subscription_Outbox__c> outboxRecordsUnsorted = loadDueOutboxes();
   
       Set<String> deadGroupIds = getDeadGroups(outboxRecordsUnsorted);
   
@@ -135,6 +112,35 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
       // attempt to save results with Lock
       finalizer.save();
+    }
+  
+    /**
+     * Every outbox that is due when the run starts, locked.
+     * The lock is released as soon as the first HTTP callout is made.
+     */
+    private List<TB_Subscription_Outbox__c> loadDueOutboxes() {
+      return [
+        SELECT
+          Subscription__c,
+          Group_Id__c,
+          Outbox_Message__c,
+          Outbox_Message__r.Sequence_Number__c,
+          Outbox_Message__r.Message__c,
+          Outbox_Message__r.Type__c,
+          Log__c,
+          Last_Error_Message__c,
+          Relay_Attempts__c,
+          Completed_Timestamp__c,
+          Next_Attempt_Timestamp__c,
+          TTL__c
+        FROM TB_Subscription_Outbox__c
+        WHERE
+          Completed_Timestamp__c = NULL
+          AND Dead_Lettered__c = FALSE
+          AND (Next_Attempt_Timestamp__c <= :executeStart
+          OR Next_Attempt_Timestamp__c = NULL)
+        FOR UPDATE
+      ];
     }
   
     /**
