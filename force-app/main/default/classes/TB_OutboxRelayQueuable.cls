@@ -1,4 +1,5 @@
 public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallouts {
+    @TestVisible
     static DateTime executeStart;
     public TB_OutboxRelayQueuable() {
     }
@@ -9,9 +10,156 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     public void execute(QueueableContext ctx) {
       executeStart = System.now();
   
-      // Checkout outbox records with Lock.
-      // NOTE: This lock will be released as soon as the first HTTP callout is made :(
-      List<TB_Subscription_Outbox__c> outboxRecordsUnsorted = [
+      List<TB_Subscription_Outbox__c> outboxRecordsUnsorted = loadDueOutboxes();
+  
+      GroupHolds holds = findGroupHolds(outboxRecordsUnsorted);
+  
+      // Sort by Sequence Number
+      List<TB_Subscription_Outbox__c> outboxRecords = TB_OutboxUtils.sortOutboxForProcessing(
+        outboxRecordsUnsorted
+      );
+  
+      Map<String, TB_Outbox_Message__c[]> msgsByType = groupMessagesByType(
+        outboxRecords
+      );
+  
+      // transform DTO's
+      Map<Id, Object> allResolvedMessages = resolveMessages(msgsByType);
+  
+      Map<String, TB_Message_Subscription__mdt> subscriptionsMetadataMap = TB_OutboxMetadataProvider.getMessageSubscritionMap(
+        msgsByType.keySet()
+      );
+  
+      OutboxFinalizer finalizer = attachFinalizer(
+        subscriptionsMetadataMap.values(),
+        holds
+      );
+  
+      Boolean isFirst = true;
+      // Process Each Outbox
+      for (TB_Subscription_Outbox__c item : outboxRecords) {
+        if (holds.isHeld(item)) {
+          continue;
+        }
+  
+        TB_Message_Subscription__mdt subDef = subscriptionsMetadataMap.get(
+          item.Subscription__c
+        );
+  
+        // DO NOT process isolated outbox unless it's first
+        if (!isFirst && subDef.Isolate_Relay__c) {
+          holds.hold(item);
+          continue;
+        }
+  
+        Object resolvedEvt = allResolvedMessages.get(item.Outbox_Message__c);
+  
+        isFirst = false;
+        Boolean delivered = attemptRelay(item, resolvedEvt, subDef, finalizer);
+        if (!delivered) {
+          holds.hold(item);
+        }
+  
+        // do not process any additional records
+        if (subDef.Isolate_Relay__c) {
+          break;
+        }
+      }
+  
+      // attempt to save results with Lock
+      finalizer.save();
+    }
+  
+    /**
+     * Message resolvers work on one message type at a time, in the order the outboxes will be processed.
+     * A message appears once for each of its outboxes.
+     */
+    private Map<String, TB_Outbox_Message__c[]> groupMessagesByType(
+      List<TB_Subscription_Outbox__c> outboxRecords
+    ) {
+      Map<String, TB_Outbox_Message__c[]> msgsByType = new Map<String, TB_Outbox_Message__c[]>();
+      for (TB_Subscription_Outbox__c item : outboxRecords) {
+        if (!msgsByType.containsKey(item.Outbox_Message__r.Type__c)) {
+          msgsByType.put(
+            item.Outbox_Message__r.Type__c,
+            new List<TB_Outbox_Message__c>{}
+          );
+        }
+  
+        msgsByType.get(item.Outbox_Message__r.Type__c)
+          .add(item.Outbox_Message__r);
+      }
+      return msgsByType;
+    }
+  
+    /**
+     * Builds the after-relay actions and attaches the finalizer before any attempt is made,
+     * so results are stored even if the run is stopped by a limit.
+     * An after-relay action class that cannot be built is thrown from here.
+     */
+    private OutboxFinalizer attachFinalizer(
+      List<TB_Message_Subscription__mdt> subscriptions,
+      GroupHolds holds
+    ) {
+      Map<String, TB_IAfterRelayAction> afterRelayActions = TB_OutboxMetadataProvider.getAfterRelayActionsMap(
+        subscriptions
+      );
+  
+      OutboxFinalizer finalizer = new OutboxFinalizer(
+        afterRelayActions,
+        holds
+      );
+      System.attachFinalizer(finalizer);
+      return finalizer;
+    }
+  
+    /**
+     * Makes one relay attempt for an outbox and hands the outcome to the finalizer.
+     * Returns whether the attempt finished without an exception.
+     * A subscription config that cannot be read is thrown from here before the attempt is counted.
+     */
+    private Boolean attemptRelay(
+      TB_Subscription_Outbox__c item,
+      Object resolvedEvt,
+      TB_Message_Subscription__mdt subDef,
+      OutboxFinalizer finalizer
+    ) {
+      TB_OutboxRelayContext obCtx = new TB_OutboxRelayContext(
+        item,
+        resolvedEvt,
+        subDef
+      );
+  
+      Boolean delivered = false;
+      try {
+        obCtx.setAttempt();
+  
+        // rethrow if we failed to resolve the message!
+        if (resolvedEvt != null && resolvedEvt instanceof Exception) {
+          throw (Exception) resolvedEvt;
+        }
+  
+        TB_IOutboxRelayClient client = TB_OutboxMetadataProvider.getSubscriptionRelayClient(
+          subDef
+        );
+        client.send(obCtx);
+        obCtx.setSuccess();
+        delivered = true;
+      } catch (Exception e) {
+        obCtx.setError(e);
+      } finally {
+        //TODO: should this be added before? What happens if limit exception is thrown?
+        finalizer.addResult(obCtx);
+      }
+      return delivered;
+    }
+  
+    /**
+     * Every outbox that is due when the run starts, locked.
+     * The lock is released as soon as the first HTTP callout is made.
+     */
+    private List<TB_Subscription_Outbox__c> loadDueOutboxes() {
+      return [
         SELECT
           Subscription__c,
           Group_Id__c,
@@ -33,114 +181,14 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           OR Next_Attempt_Timestamp__c = NULL)
         FOR UPDATE
       ];
-  
-      Set<String> deadGroupIds = getDeadGroups(outboxRecordsUnsorted);
-  
-      // Sort by Sequence Number
-      List<TB_Subscription_Outbox__c> outboxRecords = TB_OutboxUtils.sortOutboxForProcessing(
-        outboxRecordsUnsorted
-      );
-  
-      // group messages by type to resolve
-      Map<String, TB_Outbox_Message__c[]> msgsByType = new Map<String, TB_Outbox_Message__c[]>();
-      for (TB_Subscription_Outbox__c item : outboxRecords) {
-        if (!msgsByType.containsKey(item.Outbox_Message__r.Type__c)) {
-          msgsByType.put(
-            item.Outbox_Message__r.Type__c,
-            new List<TB_Outbox_Message__c>{}
-          );
-        }
-  
-        msgsByType.get(item.Outbox_Message__r.Type__c)
-          .add(item.Outbox_Message__r);
-      }
-  
-      // transform DTO's
-      Map<Id, Object> allResolvedMessages = resolveMessages(msgsByType);
-  
-      Map<String, TB_Message_Subscription__mdt> subscriptionsMetadataMap = TB_OutboxMetadataProvider.getMessageSubscritionMap(
-        msgsByType.keySet()
-      );
-  
-      Map<String, TB_IAfterRelayAction> afterRelayActions = TB_OutboxMetadataProvider.getAfterRelayActionsMap(
-        subscriptionsMetadataMap.values()
-      );
-  
-      OutboxFinalizer finalizer = new OutboxFinalizer(
-        afterRelayActions,
-        deadGroupIds
-      );
-      System.attachFinalizer(finalizer);
-  
-      Boolean isFirst = true;
-      // Process Each Outbox
-      for (TB_Subscription_Outbox__c item : outboxRecords) {
-        //check if item is part of a "deadlettered group"
-        if (item.Group_Id__c != null && deadGroupIds.contains(item.Group_Id__c)) {
-          continue;
-        }
-  
-        TB_Message_Subscription__mdt subDef = subscriptionsMetadataMap.get(
-          item.Subscription__c
-        );
-  
-        // DO NOT process isolated outbox unless it's first
-        if (!isFirst && subDef.Isolate_Relay__c) {
-          if (item.Group_Id__c != null) {
-            // cannot continue processing any other messages in this group
-            deadGroupIds.add(item.Group_Id__c);
-          }
-          continue;
-        }
-  
-        Object resolvedEvt = allResolvedMessages.get(item.Outbox_Message__c);
-  
-        TB_OutboxRelayContext obCtx = new TB_OutboxRelayContext(
-          item,
-          resolvedEvt,
-          subDef
-        );
-  
-        try {
-          isFirst = false;
-          obCtx.setAttempt();
-  
-          // rethrow if we failed to resolve the message!
-          if (resolvedEvt != null && resolvedEvt instanceof Exception) {
-            throw (Exception) resolvedEvt;
-          }
-  
-          TB_IOutboxRelayClient client = TB_OutboxMetadataProvider.getSubscriptionRelayClient(
-            subDef
-          );
-          client.send(obCtx);
-          obCtx.setSuccess();
-        } catch (Exception e) {
-          obCtx.setError(e);
-          if (item.Group_Id__c != null) {
-            // cannot continue processing any other messages in this group
-            deadGroupIds.add(item.Group_Id__c);
-          }
-        } finally {
-          //TODO: should this be added before? What happens if limit exception is thrown?
-          finalizer.addResult(obCtx);
-        }
-  
-        // do not process any additional records
-        if (subDef.Isolate_Relay__c) {
-          break;
-        }
-      }
-  
-      // attempt to save results with Lock
-      finalizer.save();
     }
   
     /**
-     * Dead groups are subscription message groups which have an item in the dead letter queue.
-     * We cannot continue processing the rest of the group until resolved
+     * Finds the groups that are held before the run attempts anything:
+     * those with an outbox that is dead-lettered or has a next attempt time still to come.
+     * A completed outbox whose relay client set a next attempt time counts too.
      */
-    private Set<String> getDeadGroups(
+    private GroupHolds findGroupHolds(
       List<TB_Subscription_Outbox__c> outboxRecords
     ) {
       Set<String> activeGroupIds = new Set<String>();
@@ -164,7 +212,36 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         }
       }
   
-      return deadGroups;
+      return new GroupHolds(deadGroups);
+    }
+  
+    /**
+     * The message groups this run must not attempt.
+     * The rest of a group cannot be processed once one of its outboxes is dead-lettered,
+     * has a next attempt time still to come, failed in this run, or was passed over in this run.
+     * The finalizer reads the same holds when it decides whether to queue another run.
+     */
+    private class GroupHolds {
+      private Set<String> groupIds;
+  
+      private GroupHolds(Set<String> groupIds) {
+        this.groupIds = groupIds;
+      }
+  
+      public Boolean isHeld(TB_Subscription_Outbox__c item) {
+        return item.Group_Id__c != null && groupIds.contains(item.Group_Id__c);
+      }
+  
+      /** An outbox with no group holds nothing. */
+      public void hold(TB_Subscription_Outbox__c item) {
+        if (item.Group_Id__c != null) {
+          groupIds.add(item.Group_Id__c);
+        }
+      }
+  
+      public Set<String> heldGroupIds() {
+        return groupIds;
+      }
     }
   
     /**
@@ -211,15 +288,15 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       private Map<Id, TB_OutboxRelayContext> results;
       private Set<Id> saved;
   
-      public Set<String> deadGroupIds;
+      private GroupHolds holds;
   
       private Map<String, TB_IAfterRelayAction> afterRelayActions = new Map<String, TB_IAfterRelayAction>();
   
       private OutboxFinalizer(
         Map<String, TB_IAfterRelayAction> afterRelayActions,
-        Set<String> deadGroupIds
+        GroupHolds holds
       ) {
-        this.deadGroupIds = deadGroupIds;
+        this.holds = holds;
         this.afterRelayActions = afterRelayActions;
         saved = new Set<Id>();
         results = new Map<Id, TB_OutboxRelayContext>();
@@ -281,6 +358,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         save();
   
         try {
+          Set<String> heldGroupIds = holds.heldGroupIds();
           TB_Subscription_Outbox__c[] activeOutboxItems = [
             SELECT Id
             FROM TB_Subscription_Outbox__c
@@ -289,7 +367,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
               AND Dead_Lettered__c = FALSE
               AND (Next_Attempt_Timestamp__c <= :System.now()
               OR Next_Attempt_Timestamp__c = NULL)
-              AND Group_Id__c NOT IN :deadGroupIds
+              AND Group_Id__c NOT IN :heldGroupIds
             LIMIT 1
           ];
           // more work to be done

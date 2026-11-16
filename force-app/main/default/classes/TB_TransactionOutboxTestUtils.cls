@@ -37,8 +37,39 @@ public class TB_TransactionOutboxTestUtils {
         return subscription;
     }
 
+    static Boolean finalizerMayQueueNextRun = false;
+
+    /**
+     * Call after publishing and before Test.stopTest().
+     *
+     * In production a relay run's finalizer has its own transaction, so the two static guards in
+     * TB_OutboxRelayQueuable.enqueue start out unset and the finalizer can queue the next run.
+     * In a test the publishing code, the run and the finalizer share statics, so both guards are
+     * still set when the finalizer gets there. This clears the publisher's guard now, and has
+     * TestClient clear the run's guard during its first send.
+     *
+     * A test using this depends on three things:
+     * - The run reaches TestClient at least once. Otherwise the run's guard is never cleared.
+     * - The run does not read executeStart after its first send. It would read null.
+     * - Nothing in the run publishes a message. That would queue a job from inside the run,
+     *   and the test could not tell it from one the finalizer queued.
+     */
+    public static void letFinalizerQueueNextRun() {
+        TB_OutboxRelayQueuable.alreadyQueuedInContext = false;
+        finalizerMayQueueNextRun = true;
+    }
+
+    // One entry per call to TestClient.send, holding the resolved message the client was given.
+    @testVisible
+    static List<Object> sentMessages = new List<Object>();
     public class TestClient implements TB_IOutboxRelayClient {
         public void send(TB_OutboxRelayContext ctx) {
+            sentMessages.add(ctx.resolvedMessage);
+            if (finalizerMayQueueNextRun) {
+                // Cleared once, so the tests are about the first run's finalizer only.
+                finalizerMayQueueNextRun = false;
+                TB_OutboxRelayQueuable.executeStart = null;
+            }
             if (ctx.subscriptionConfig.containsKey('log')) {
                 ctx.log(ctx.subscriptionConfig.get('log'));
             }
@@ -58,6 +89,42 @@ public class TB_TransactionOutboxTestUtils {
                 result.put(msg.Id, 'resolved:' + msg.Message__c);
             }
             return result;
+        }
+    }
+
+    public class ThrowingResolver implements TB_IOutboxMessageResolver {
+        public Map<Id, Object> resolveMessages(TB_Outbox_Message__c[] messages) {
+            throw new TestException('Resolver Error');
+        }
+    }
+
+    // One entry per call to RecordingAction.execute, holding the argument as it was passed, null included.
+    @testVisible
+    static List<List<TB_OutboxRelayContext>> actionCalls = new List<List<TB_OutboxRelayContext>>();
+    // For each call, how many of the outboxes it was given were already stored with their attempt counted.
+    @testVisible
+    static List<Integer> actionSavedCounts = new List<Integer>();
+    public class RecordingAction implements TB_IAfterRelayAction {
+        public void execute(TB_OutboxRelayContext[] ctx) {
+            actionCalls.add(ctx);
+            Set<Id> outboxIds = new Set<Id>();
+            if (ctx != null) {
+                for (TB_OutboxRelayContext item : ctx) {
+                    outboxIds.add(item.outbox.Id);
+                }
+            }
+            actionSavedCounts.add(
+                [SELECT COUNT() FROM TB_Subscription_Outbox__c WHERE Id IN :outboxIds AND Relay_Attempts__c > 0]
+            );
+        }
+    }
+
+    @testVisible
+    static Integer throwingActionCalls = 0;
+    public class ThrowingAction implements TB_IAfterRelayAction {
+        public void execute(TB_OutboxRelayContext[] ctx) {
+            throwingActionCalls++;
+            throw new TestException('Action Error');
         }
     }
 
