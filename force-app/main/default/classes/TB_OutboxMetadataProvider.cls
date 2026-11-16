@@ -48,6 +48,46 @@ public class TB_OutboxMetadataProvider {
         return subscriptionsByLabel;
     }
 
+    @testVisible
+    static TB_Framework_Settings__mdt[] frameworkSettings;
+
+    // A run can read 20 outboxes per unit of batch size while it searches, and a transaction
+    // may read 50,000 rows in all. This keeps the search to 20,000 and leaves the rest for
+    // relay clients and message resolvers.
+    static final Integer MAX_RELAY_BATCH_SIZE = 1000;
+
+    /**
+     * The most relay attempts one relay run makes.
+     * It is read from the framework settings record named Default and from nowhere else,
+     * so a missing record or value is an error and never a silently assumed number.
+     */
+    public static Integer getRelayBatchSize() {
+        if (frameworkSettings == null) {
+            frameworkSettings = [
+                SELECT DeveloperName, Relay_Batch_Size__c
+                FROM TB_Framework_Settings__mdt
+                WHERE DeveloperName = 'Default'
+            ];
+        }
+        if (frameworkSettings.isEmpty()) {
+            throw new TB_InvalidConfigException(
+                'No TB_Framework_Settings__mdt record named Default was found. The relay needs it for Relay_Batch_Size__c.'
+            );
+        }
+
+        Decimal batchSize = frameworkSettings[0].Relay_Batch_Size__c;
+        if (batchSize == null || batchSize < 1 || batchSize > MAX_RELAY_BATCH_SIZE) {
+            throw new TB_InvalidConfigException(
+                'Relay_Batch_Size__c on the TB_Framework_Settings__mdt record named Default must be from 1 to ' +
+                    MAX_RELAY_BATCH_SIZE +
+                    '. It is ' +
+                    batchSize +
+                    '.'
+            );
+        }
+        return batchSize.intValue();
+    }
+
     static Map<String, Map<String, Object>> configCache = new Map<String, Map<String, Object>>();
     public static Map<String, Object> getSubscriptionConfig(TB_Message_Subscription__mdt subscriptionDef) {
         if (configCache.containsKey(subscriptionDef.DeveloperName)) {

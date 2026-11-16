@@ -17,11 +17,16 @@
     <name>ApexClass</name>
   </types>
   <types>
+    <members>TB_Framework_Settings.Default</members>
+    <name>CustomMetadata</name>
+  </types>
+  <types>
     <members>TB_OutboxMessageTrigger</members>
     <name>ApexTrigger</name>
   </types>
   <types>
     <members>TB_Application__mdt</members>
+    <members>TB_Framework_Settings__mdt</members>
     <members>TB_Message_Definition__mdt</members>
     <members>TB_Message_Subscription__mdt</members>
     <members>TB_Outbox_Message__c</members>

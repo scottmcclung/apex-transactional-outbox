@@ -177,9 +177,15 @@ This can be enabled by checking the `Message Subscription -> Isolate Relay` box.
 
 ### Relay Limits
 
-THe `TB_OutboxRelayQueuable` will attempt to process all the messages in the outbox, without any consideration of if it will exceed the context limits. If a limit is hit, the `TransactionalFinalizer` should result in the Relay Results being properly recorded.
+A relay run attempts at most `Relay Batch Size` outboxes, oldest first, and leaves the rest for the next run. When a run ends and an outbox that can go is left, the next run is queued at once.
 
-This allows the Relay to operate at maximum efficiency without having to have knowledge of the resources consumed by the different "Relay Clients".
+The value is set on the `TB Framework Settings` custom metadata record named `Default`. The record ships with a value of 100. The relay does not assume a value: if the record is missing, or the value is not from 1 to 1000, every relay run fails with an error that says so.
+
+Keep the batch size at or under 100 when relay clients make one callout per send, because a transaction allows 100 callouts.
+
+An outbox that is already held when the run starts does not count toward the batch size. An outbox that becomes held during the run, because an earlier message in its group failed, has already been chosen. It is not attempted and its place is not given to another outbox. A run reads up to 10 pages of due outboxes, each twice the batch size, while it looks for outboxes it can attempt.
+
+The run does not yet check the remaining platform limits before each attempt. A run with slow subscribers can still use up the 120 seconds a transaction allows for callouts. If a limit is hit, the `TransactionalFinalizer` should result in the Relay Results being properly recorded.
 
 ### Record Cleanup
 
