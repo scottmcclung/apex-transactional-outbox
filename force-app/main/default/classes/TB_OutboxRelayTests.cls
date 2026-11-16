@@ -890,4 +890,184 @@ public class TB_OutboxRelayTests {
         System.assertEquals(1, relayJobCount(), 'No further run should be queued');
         System.assertEquals(0, outboxes[1].Relay_Attempts__c, 'The isolated outbox should be left unattempted');
     }
+
+    static void setRelayBatchSize(Integer batchSize) {
+        TB_OutboxMetadataProvider.frameworkSettings = new List<TB_Framework_Settings__mdt>{
+            new TB_Framework_Settings__mdt(DeveloperName = 'Default', Relay_Batch_Size__c = batchSize)
+        };
+    }
+
+    static TB_Outbox_Message__c newGroupedMessage(TB_Message_Definition__mdt msgDef, String groupId) {
+        TB_Outbox_Message__c message = newMessage(msgDef);
+        message.Group_Id__c = groupId;
+        return message;
+    }
+
+    static void makeFirstOutboxWaitOnBackoff() {
+        TB_Subscription_Outbox__c first = outboxesInOrder()[0];
+        first.Next_Attempt_Timestamp__c = System.now().addMinutes(30);
+        update first;
+    }
+
+    static List<Integer> attemptsInOrder() {
+        List<Integer> attempts = new List<Integer>();
+        for (TB_Subscription_Outbox__c outbox : outboxesInOrder()) {
+            attempts.add((Integer) outbox.Relay_Attempts__c);
+        }
+        return attempts;
+    }
+
+    @isTest
+    static void testRunAttemptsNoMoreThanTheBatchSize() {
+        setRelayBatchSize(2);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(msgDef), newMessage(msgDef) };
+        Test.stopTest();
+
+        System.assertEquals(
+            new List<Integer>{ 1, 1, 0 },
+            attemptsInOrder(),
+            'The two oldest outboxes should be attempted and the third left alone'
+        );
+        System.assertEquals(2, TB_TransactionOutboxTestUtils.sentMessages.size(), 'The client should be called twice');
+    }
+
+    @isTest
+    static void testNextRunTakesWhatTheBatchSizeLeftBehind() {
+        setRelayBatchSize(2);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(msgDef), newMessage(msgDef) };
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        System.assertEquals(2, relayJobCount(), 'The first run should queue a second for the outbox it left');
+        System.assertEquals(new List<Integer>{ 1, 1, 1 }, attemptsInOrder(), 'Each outbox should be attempted once');
+    }
+
+    @isTest
+    static void testHeldGroupDoesNotUseUpTheBatchSize() {
+        setRelayBatchSize(2);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1'),
+            newMessage(msgDef),
+            newMessage(msgDef)
+        };
+        makeFirstOutboxWaitOnBackoff();
+        Test.stopTest();
+
+        System.assertEquals(
+            new List<Integer>{ 0, 0, 1, 1 },
+            attemptsInOrder(),
+            'The run should pass over the held group and attempt the two outboxes behind it'
+        );
+    }
+
+    /**
+     * The run looks at due outboxes a page at a time, and a page is twice the batch size.
+     * Here the first page holds nothing but outboxes of one held group.
+     */
+    @isTest
+    static void testRunLooksPastAPageOfHeldOutboxes() {
+        setRelayBatchSize(2);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1'),
+            newMessage(msgDef),
+            newMessage(msgDef)
+        };
+        makeFirstOutboxWaitOnBackoff();
+        Test.stopTest();
+
+        System.assertEquals(
+            new List<Integer>{ 0, 0, 0, 0, 0, 1, 1 },
+            attemptsInOrder(),
+            'The run should reach the two outboxes behind the held group'
+        );
+    }
+
+    @isTest
+    static void testRunFailsWhenFrameworkSettingsAreMissing() {
+        TB_OutboxMetadataProvider.frameworkSettings = new List<TB_Framework_Settings__mdt>();
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        String failure;
+        Test.startTest();
+        insert newMessage(msgDef);
+        try {
+            Test.stopTest();
+        } catch (TB_OutboxMetadataProvider.TB_InvalidConfigException e) {
+            failure = e.getMessage();
+        }
+
+        System.assertNotEquals(null, failure, 'The run should fail and say why');
+        System.assert(failure.contains('TB_Framework_Settings__mdt'), 'The error should name the settings type: ' + failure);
+        System.assertEquals(new List<Integer>{ 0 }, attemptsInOrder(), 'Nothing should be attempted on an assumed batch size');
+    }
+
+    @isTest
+    static void testRunFailsWhenBatchSizeIsBelowOne() {
+        setRelayBatchSize(0);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        String failure;
+        Test.startTest();
+        insert newMessage(msgDef);
+        try {
+            Test.stopTest();
+        } catch (TB_OutboxMetadataProvider.TB_InvalidConfigException e) {
+            failure = e.getMessage();
+        }
+
+        System.assertNotEquals(null, failure, 'The run should fail and say why');
+        System.assert(failure.contains('Relay_Batch_Size__c'), 'The error should name the setting: ' + failure);
+        System.assertEquals(new List<Integer>{ 0 }, attemptsInOrder());
+    }
+
+    @isTest
+    static void testNextRunIsQueuedForUngroupedOutboxWhileAGroupIsHeld() {
+        setRelayBatchSize(1);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1'),
+            newMessage(msgDef),
+            newMessage(msgDef)
+        };
+        makeFirstOutboxWaitOnBackoff();
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        Test.stopTest();
+
+        System.assertEquals(2, relayJobCount(), 'The ungrouped outbox the first run left should start a second run');
+        System.assertEquals(new List<Integer>{ 0, 0, 1, 1 }, attemptsInOrder());
+    }
 }

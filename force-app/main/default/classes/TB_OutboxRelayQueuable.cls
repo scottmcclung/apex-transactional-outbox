@@ -5,18 +5,17 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     }
   
     /**
-     * - Intentionally not dealing with callout Limits... This should maxiumize the work done in a single Async Context
+     * One relay run. It attempts at most the configured batch size and leaves the rest for the next run.
+     * It does not check the remaining platform limits before an attempt. A run cut short by a limit
+     * relies on the finalizer to store what was done.
      */
     public void execute(QueueableContext ctx) {
       executeStart = System.now();
   
-      List<TB_Subscription_Outbox__c> outboxRecordsUnsorted = loadDueOutboxes();
-  
-      GroupHolds holds = findGroupHolds(outboxRecordsUnsorted);
-  
-      // Sort by Sequence Number
-      List<TB_Subscription_Outbox__c> outboxRecords = TB_OutboxUtils.sortOutboxForProcessing(
-        outboxRecordsUnsorted
+      GroupHolds holds = new GroupHolds();
+      List<TB_Subscription_Outbox__c> outboxRecords = selectAttemptable(
+        TB_OutboxMetadataProvider.getRelayBatchSize(),
+        holds
       );
   
       Map<String, TB_Outbox_Message__c[]> msgsByType = groupMessagesByType(
@@ -154,65 +153,171 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       return delivered;
     }
   
+    // The most pages of due outboxes one run reads while looking for outboxes it can attempt.
+    private static final Integer MAX_SCAN_PAGES = 10;
+  
     /**
-     * Every outbox that is due when the run starts, locked.
-     * The lock is released as soon as the first HTTP callout is made.
+     * Chooses the outboxes this run will attempt: the oldest due outboxes whose group is not held,
+     * up to the batch size. Everything else is left for a later run.
+     *
+     * Due outboxes are read a page at a time in publish order, with small fields and no lock.
+     * Groups found to be held are added to the holds, and later pages leave them out,
+     * so a long held group does not use up the pages. Only the chosen outboxes are then
+     * loaded with their payloads and locked.
+     *
+     * The search gives up after MAX_SCAN_PAGES pages. If more distinct held groups than that
+     * covers sit ahead of an outbox that could go, this run does not reach it.
      */
-    private List<TB_Subscription_Outbox__c> loadDueOutboxes() {
+    private List<TB_Subscription_Outbox__c> selectAttemptable(
+      Integer batchSize,
+      GroupHolds holds
+    ) {
+      Integer pageSize = batchSize * 2;
+      List<Id> chosenIds = new List<Id>();
+      TB_Subscription_Outbox__c lastSeen = null;
+  
+      for (
+        Integer page = 0;
+        page < MAX_SCAN_PAGES && chosenIds.size() < batchSize;
+        page++
+      ) {
+        List<TB_Subscription_Outbox__c> candidates = loadDuePage(
+          pageSize,
+          lastSeen,
+          holds.heldGroupIds()
+        );
+        holds.holdGroups(findHeldGroupIds(candidates, holds));
+  
+        for (TB_Subscription_Outbox__c candidate : candidates) {
+          if (chosenIds.size() < batchSize && !holds.isHeld(candidate)) {
+            chosenIds.add(candidate.Id);
+          }
+        }
+  
+        if (candidates.size() < pageSize) {
+          break;
+        }
+        lastSeen = candidates[candidates.size() - 1];
+      }
+  
+      return loadForAttempt(chosenIds);
+    }
+  
+    /**
+     * One page of due outboxes in publish order, starting after the last one already seen.
+     * Outboxes of one message share a sequence number, so the record id settles the order
+     * between them and lets the next page start in the right place.
+     */
+    private List<TB_Subscription_Outbox__c> loadDuePage(
+      Integer pageSize,
+      TB_Subscription_Outbox__c lastSeen,
+      Set<String> heldGroupIds
+    ) {
+      if (lastSeen == null) {
+        return [
+          SELECT Id, Group_Id__c, Outbox_Message__r.Sequence_Number__c
+          FROM TB_Subscription_Outbox__c
+          WHERE
+            Completed_Timestamp__c = NULL
+            AND Dead_Lettered__c = FALSE
+            AND (Next_Attempt_Timestamp__c <= :executeStart
+            OR Next_Attempt_Timestamp__c = NULL)
+          ORDER BY Outbox_Message__r.Sequence_Number__c, Id
+          LIMIT :pageSize
+        ];
+      }
+  
+      String lastSequence = lastSeen.Outbox_Message__r.Sequence_Number__c;
+      Id lastId = lastSeen.Id;
       return [
-        SELECT
-          Subscription__c,
-          Group_Id__c,
-          Outbox_Message__c,
-          Outbox_Message__r.Sequence_Number__c,
-          Outbox_Message__r.Message__c,
-          Outbox_Message__r.Type__c,
-          Log__c,
-          Last_Error_Message__c,
-          Relay_Attempts__c,
-          Completed_Timestamp__c,
-          Next_Attempt_Timestamp__c,
-          TTL__c
+        SELECT Id, Group_Id__c, Outbox_Message__r.Sequence_Number__c
         FROM TB_Subscription_Outbox__c
         WHERE
           Completed_Timestamp__c = NULL
           AND Dead_Lettered__c = FALSE
           AND (Next_Attempt_Timestamp__c <= :executeStart
           OR Next_Attempt_Timestamp__c = NULL)
-        FOR UPDATE
+          AND Group_Id__c NOT IN :heldGroupIds
+          AND (Outbox_Message__r.Sequence_Number__c > :lastSequence
+          OR (Outbox_Message__r.Sequence_Number__c = :lastSequence
+          AND Id > :lastId))
+        ORDER BY Outbox_Message__r.Sequence_Number__c, Id
+        LIMIT :pageSize
       ];
     }
   
     /**
-     * Finds the groups that are held before the run attempts anything:
-     * those with an outbox that is dead-lettered or has a next attempt time still to come.
-     * A completed outbox whose relay client set a next attempt time counts too.
+     * Of the groups these outboxes belong to, the ones that are held and not yet known to be:
+     * those with an outbox that is dead-lettered or still waiting on its backoff.
+     * We cannot continue processing the rest of such a group until that is resolved.
      */
-    private GroupHolds findGroupHolds(
-      List<TB_Subscription_Outbox__c> outboxRecords
+    private Set<String> findHeldGroupIds(
+      List<TB_Subscription_Outbox__c> outboxRecords,
+      GroupHolds holds
     ) {
-      Set<String> activeGroupIds = new Set<String>();
+      Set<String> unknownGroupIds = new Set<String>();
       for (TB_Subscription_Outbox__c item : outboxRecords) {
-        if (item.Group_Id__c != null) {
-          activeGroupIds.add(item.Group_Id__c);
+        if (item.Group_Id__c != null && !holds.isHeld(item)) {
+          unknownGroupIds.add(item.Group_Id__c);
         }
       }
   
-      Set<String> deadGroups = new Set<String>();
-      if (activeGroupIds.size() > 0) {
+      Set<String> heldGroupIds = new Set<String>();
+      if (unknownGroupIds.size() > 0) {
         for (TB_Subscription_Outbox__c item : [
           SELECT Group_Id__c
           FROM TB_Subscription_Outbox__c
           WHERE
             (Dead_Lettered__c = TRUE
             OR Next_Attempt_Timestamp__c > :executeStart)
-            AND Group_Id__c IN :activeGroupIds
+            AND Group_Id__c IN :unknownGroupIds
         ]) {
-          deadGroups.add(item.Group_Id__c);
+          heldGroupIds.add(item.Group_Id__c);
         }
       }
   
-      return new GroupHolds(deadGroups);
+      return heldGroupIds;
+    }
+  
+    /**
+     * Loads the chosen outboxes with their payloads, locked, in the order they were chosen.
+     * The lock is released as soon as the first HTTP callout is made.
+     * An outbox that stopped being due since it was chosen is left out.
+     */
+    private List<TB_Subscription_Outbox__c> loadForAttempt(List<Id> chosenIds) {
+      Map<Id, TB_Subscription_Outbox__c> loaded = new Map<Id, TB_Subscription_Outbox__c>(
+        [
+          SELECT
+            Subscription__c,
+            Group_Id__c,
+            Outbox_Message__c,
+            Outbox_Message__r.Sequence_Number__c,
+            Outbox_Message__r.Message__c,
+            Outbox_Message__r.Type__c,
+            Log__c,
+            Last_Error_Message__c,
+            Relay_Attempts__c,
+            Completed_Timestamp__c,
+            Next_Attempt_Timestamp__c,
+            TTL__c
+          FROM TB_Subscription_Outbox__c
+          WHERE
+            Id IN :chosenIds
+            AND Completed_Timestamp__c = NULL
+            AND Dead_Lettered__c = FALSE
+            AND (Next_Attempt_Timestamp__c <= :executeStart
+            OR Next_Attempt_Timestamp__c = NULL)
+          FOR UPDATE
+        ]
+      );
+  
+      List<TB_Subscription_Outbox__c> inChosenOrder = new List<TB_Subscription_Outbox__c>();
+      for (Id chosenId : chosenIds) {
+        if (loaded.containsKey(chosenId)) {
+          inChosenOrder.add(loaded.get(chosenId));
+        }
+      }
+      return inChosenOrder;
     }
   
     /**
@@ -222,11 +327,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      * The finalizer reads the same holds when it decides whether to queue another run.
      */
     private class GroupHolds {
-      private Set<String> groupIds;
-  
-      private GroupHolds(Set<String> groupIds) {
-        this.groupIds = groupIds;
-      }
+      private Set<String> groupIds = new Set<String>();
   
       public Boolean isHeld(TB_Subscription_Outbox__c item) {
         return item.Group_Id__c != null && groupIds.contains(item.Group_Id__c);
@@ -237,6 +338,10 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         if (item.Group_Id__c != null) {
           groupIds.add(item.Group_Id__c);
         }
+      }
+  
+      public void holdGroups(Set<String> heldGroupIds) {
+        groupIds.addAll(heldGroupIds);
       }
   
       public Set<String> heldGroupIds() {
