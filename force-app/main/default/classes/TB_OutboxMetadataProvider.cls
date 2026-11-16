@@ -51,6 +51,11 @@ public class TB_OutboxMetadataProvider {
     @testVisible
     static TB_Framework_Settings__mdt[] frameworkSettings;
 
+    // A run can read 20 outboxes per unit of batch size while it searches, and a transaction
+    // may read 50,000 rows in all. This keeps the search to 20,000 and leaves the rest for
+    // relay clients and message resolvers.
+    static final Integer MAX_RELAY_BATCH_SIZE = 1000;
+
     /**
      * The most relay attempts one relay run makes.
      * It is read from the framework settings record named Default and from nowhere else,
@@ -71,9 +76,13 @@ public class TB_OutboxMetadataProvider {
         }
 
         Decimal batchSize = frameworkSettings[0].Relay_Batch_Size__c;
-        if (batchSize == null || batchSize < 1) {
+        if (batchSize == null || batchSize < 1 || batchSize > MAX_RELAY_BATCH_SIZE) {
             throw new TB_InvalidConfigException(
-                'Relay_Batch_Size__c on the TB_Framework_Settings__mdt record named Default must be 1 or more. It is ' + batchSize + '.'
+                'Relay_Batch_Size__c on the TB_Framework_Settings__mdt record named Default must be from 1 to ' +
+                    MAX_RELAY_BATCH_SIZE +
+                    '. It is ' +
+                    batchSize +
+                    '.'
             );
         }
         return batchSize.intValue();
