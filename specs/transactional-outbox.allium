@@ -203,6 +203,14 @@ contract RelayClient {
     @guidance
         -- A client should not change stored records while sending unless its
         -- subscription uses isolated relay.
+        --
+        -- A client should not look up records during a send. A send happens
+        -- once per outbox, so a lookup there costs one query per outbox.
+        -- Record state belongs in the message resolver, which is called once
+        -- for all the messages of a type. Subscribers that need different
+        -- data about the same event are given separate message definitions,
+        -- each with its own resolver. A client may reshape what the resolver
+        -- returned, as long as it does so without further lookups.
 }
 
 -- What the framework requires of any system that receives messages,
@@ -504,9 +512,11 @@ config {
     -- outbox has no copy of its backoff.
     fallback_retry_wait: Duration = 12.hours
 
-    -- The most attempts one relay run makes. An organisation changes this
-    -- to suit its scale. A run can stop sooner when it runs short of
-    -- budget, and never goes past this.
+    -- The most attempts one relay run makes. It is a required setting that
+    -- an organisation changes to suit its scale. The setting itself shows
+    -- its default of 100, so the value in use is never an assumption made
+    -- out of sight. A run can stop sooner when it runs short of budget,
+    -- and never goes past this.
     relay_run_size: Integer = 100
 }
 
