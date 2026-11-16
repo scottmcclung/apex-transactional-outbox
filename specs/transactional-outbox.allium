@@ -277,7 +277,9 @@ entity SubscriptionOutbox {
     -- Identifies this delivery: one message to one subscription. It is set
     -- when the outbox is created and never changes, so every attempt for
     -- the outbox carries the same key. A subscriber that receives the
-    -- message twice can recognise the repeat by it.
+    -- message twice can recognise the repeat by it. The key is generated
+    -- for this purpose and does not depend on where the record is stored,
+    -- so it stays valid if records are moved between systems.
     idempotency_key: String
 
     -- Linked by the subscription's name. Absent while no subscription has
