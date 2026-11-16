@@ -1175,6 +1175,22 @@ surface Publishing {
         -- skipped or expired. An application can extend this across all of
         -- its subscriptions, so that one subscription's undelivered message
         -- holds back the others for that group.
+
+    @guarantee OnlyEarlierMessagesHold
+        -- A message is held only by a message published before it in its
+        -- group. It is never held by one published after it. Where order is
+        -- shared across an application's subscriptions, it is never held by
+        -- another subscription's outbox for the same message. So when one
+        -- subscriber cannot take a message, the application's other
+        -- subscribers still receive that message, and wait only for what
+        -- comes after it.
+
+    @guarantee HeldOutboxesNeverStrandOthers
+        -- An outbox that cannot be attempted never stops one that can.
+        -- However many held outboxes were published before it, an outbox
+        -- that is due is attempted within a bounded number of relay runs.
+        -- A run that looks only at the oldest outboxes, and so can find
+        -- nothing but held ones, does not meet this.
 }
 
 surface RelaySchedule {
