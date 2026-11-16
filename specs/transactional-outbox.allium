@@ -565,7 +565,7 @@ config {
     -- its default of 100, so the value in use is never an assumption made
     -- out of sight. A run can stop sooner when it runs short of budget,
     -- and never goes past this.
-    relay_run_size: Integer = 100
+    relay_batch_size: Integer = 100
 
     -- How often the sweep and cleanup run is not a framework setting. Both
     -- are scheduled by the team that activates the framework, and that
@@ -660,8 +660,8 @@ rule BeginRelayAttempt {
     requires: outbox.is_due
     requires: outbox.has_configuration
 
-    -- A run makes no more attempts than its size allows.
-    requires: run.attempts.count < config.relay_run_size
+    -- A run makes no more attempts than its batch size allows.
+    requires: run.attempts.count < config.relay_batch_size
 
     -- An attempt starts only when the run has room for what the relay
     -- client says one send needs. has_budget_for compares that cost with
@@ -698,7 +698,7 @@ rule FailAttemptWithoutConfiguration {
     requires: outbox.status = pending
     requires: outbox.is_due
     requires: not outbox.has_configuration
-    requires: run.attempts.count < config.relay_run_size
+    requires: run.attempts.count < config.relay_batch_size
 
     -- The attempt counts and leaves a record, so an operator can see why
     -- the outbox is not being delivered. It is retried like any failure,
@@ -994,7 +994,7 @@ rule FinishRelayRun {
 
     @guidance
         -- A run ends when every pending outbox has had its turn, when it
-        -- has made as many attempts as its size allows, when it has no room
+        -- has made as many attempts as its batch size allows, when it has no room
         -- left for another attempt, or when the platform cuts it short. In
         -- every case the outcomes recorded so far are kept. A run that
         -- stops because of its size or its budget ends normally, and the
