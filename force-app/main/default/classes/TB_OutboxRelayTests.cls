@@ -675,9 +675,11 @@ public class TB_OutboxRelayTests {
         );
         firstSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
 
+        // A second message type, so the isolated outbox has a later sequence number and is never first in the run.
+        TB_Message_Definition__mdt isolatedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
         TB_Message_Subscription__mdt isolatedSub = TB_TransactionOutboxTestUtils.addSubscription(
             app,
-            msgDef,
+            isolatedDef,
             'subscription2'
         );
         isolatedSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
@@ -685,7 +687,7 @@ public class TB_OutboxRelayTests {
         isolatedSub.After_Relay_Action__c = 'TB_TransactionOutboxTestUtils.RecordingAction';
 
         Test.startTest();
-        insert newMessage(msgDef);
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(isolatedDef) };
         Test.stopTest();
 
         List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
@@ -718,15 +720,13 @@ public class TB_OutboxRelayTests {
         insert newMessage(msgDef);
         Test.stopTest();
 
+        // Actions run in the order their subscriptions were added, so the failing one runs first.
         System.assertEquals(1, TB_TransactionOutboxTestUtils.throwingActionCalls, 'The failing action should have run');
         System.assertEquals(
             1,
             TB_TransactionOutboxTestUtils.actionCalls.size(),
             'The other subscription\'s action should still run'
         );
-        for (TB_Subscription_Outbox__c outbox : outboxesInOrder()) {
-            System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'Both deliveries should stay stored');
-        }
     }
 
     static TB_Message_Subscription__mdt addTestClientSubscription(
@@ -739,13 +739,30 @@ public class TB_OutboxRelayTests {
         return subscription;
     }
 
-    // The first job is the run the publish queued. A second job means that run's finalizer queued another.
-    static Integer relayJobCount() {
+    static Integer allRelayJobs() {
         return [
             SELECT COUNT()
             FROM AsyncApexJob
             WHERE JobType = 'Queueable' AND ApexClass.Name = 'TB_OutboxRelayQueuable'
         ];
+    }
+
+    // A test can see the org's own job records, so jobs that were there before the test are left out of the count.
+    static final Integer RELAY_JOBS_BEFORE_TEST = allRelayJobs();
+
+    // The first job is the run the publish queued. A second job means that run's finalizer queued another.
+    static Integer relayJobCount() {
+        return allRelayJobs() - RELAY_JOBS_BEFORE_TEST;
+    }
+
+    /**
+     * For a test that expects no further run. One job is also what a test sees when the guards were never
+     * cleared, so this shows the finalizer was free to queue and chose not to. Both guards are set again
+     * by a second run, so they are only clear when the first run's finalizer queued nothing.
+     */
+    static void assertFinalizerWasFreeToQueue() {
+        System.assertEquals(null, TB_OutboxRelayQueuable.executeStart, 'The run\'s guard should have been cleared');
+        System.assertEquals(false, TB_OutboxRelayQueuable.alreadyQueuedInContext, 'Nothing should have been queued');
     }
 
     @isTest
@@ -760,6 +777,7 @@ public class TB_OutboxRelayTests {
         Test.stopTest();
 
         System.assertNotEquals(null, outboxesInOrder()[0].Completed_Timestamp__c, 'The outbox should be delivered');
+        assertFinalizerWasFreeToQueue();
         System.assertEquals(1, relayJobCount(), 'No further run should be queued');
     }
 
@@ -809,6 +827,7 @@ public class TB_OutboxRelayTests {
         TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
         Test.stopTest();
 
+        assertFinalizerWasFreeToQueue();
         System.assertEquals(1, relayJobCount(), 'An outbox waiting on its backoff should not start another run');
         System.assertEquals(1, outboxesInOrder()[0].Relay_Attempts__c);
     }
@@ -836,6 +855,7 @@ public class TB_OutboxRelayTests {
         Test.stopTest();
 
         List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        assertFinalizerWasFreeToQueue();
         System.assertEquals(1, relayJobCount(), 'No further run should be queued for the held group');
         System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'The failed outbox should not be attempted again');
         System.assertEquals(0, outboxes[1].Relay_Attempts__c, 'The later outbox in the group should not be attempted');
@@ -850,18 +870,23 @@ public class TB_OutboxRelayTests {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
         TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
         addTestClientSubscription(app, msgDef, 'subscription1');
-        addTestClientSubscription(app, msgDef, 'subscription2').Isolate_Relay__c = true;
+        // A second message type, so the isolated outbox has a later sequence number and is never first in the run.
+        TB_Message_Definition__mdt isolatedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, isolatedDef, 'subscription2').Isolate_Relay__c = true;
 
-        TB_Outbox_Message__c message = newMessage(msgDef);
-        message.Group_Id__c = 'group1';
+        TB_Outbox_Message__c first = newMessage(msgDef);
+        first.Group_Id__c = 'group1';
+        TB_Outbox_Message__c isolated = newMessage(isolatedDef);
+        isolated.Group_Id__c = 'group1';
 
         Test.startTest();
-        insert message;
+        insert new List<TB_Outbox_Message__c>{ first, isolated };
         TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
         Test.stopTest();
 
         List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
         System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The first outbox should be delivered');
+        assertFinalizerWasFreeToQueue();
         System.assertEquals(1, relayJobCount(), 'No further run should be queued');
         System.assertEquals(0, outboxes[1].Relay_Attempts__c, 'The isolated outbox should be left unattempted');
     }

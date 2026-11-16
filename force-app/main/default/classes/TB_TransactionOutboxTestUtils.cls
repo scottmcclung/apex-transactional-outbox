@@ -46,8 +46,13 @@ public class TB_TransactionOutboxTestUtils {
      * TB_OutboxRelayQueuable.enqueue start out unset and the finalizer can queue the next run.
      * In a test the publishing code, the run and the finalizer share statics, so both guards are
      * still set when the finalizer gets there. This clears the publisher's guard now, and has
-     * TestClient clear the run's guard during its first send. The run must reach TestClient
-     * at least once for that to happen.
+     * TestClient clear the run's guard during its first send.
+     *
+     * A test using this depends on three things:
+     * - The run reaches TestClient at least once. Otherwise the run's guard is never cleared.
+     * - The run does not read executeStart after its first send. It would read null.
+     * - Nothing in the run publishes a message. That would queue a job from inside the run,
+     *   and the test could not tell it from one the finalizer queued.
      */
     public static void letFinalizerQueueNextRun() {
         TB_OutboxRelayQueuable.alreadyQueuedInContext = false;
@@ -61,7 +66,7 @@ public class TB_TransactionOutboxTestUtils {
         public void send(TB_OutboxRelayContext ctx) {
             sentMessages.add(ctx.resolvedMessage);
             if (finalizerMayQueueNextRun) {
-                // Cleared once, so only the first run's finalizer can queue and a test cannot chain without end.
+                // Cleared once, so the tests are about the first run's finalizer only.
                 finalizerMayQueueNextRun = false;
                 TB_OutboxRelayQueuable.executeStart = null;
             }

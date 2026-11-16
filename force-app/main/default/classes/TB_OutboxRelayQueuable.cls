@@ -115,7 +115,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
     /**
      * Makes one relay attempt for an outbox and hands the outcome to the finalizer.
-     * Returns whether the relay client took the message without throwing.
+     * Returns whether the attempt finished without an exception.
      * A subscription config that cannot be read is thrown from here before the attempt is counted.
      */
     private Boolean attemptRelay(
@@ -185,7 +185,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
     /**
      * Finds the groups that are held before the run attempts anything:
-     * those with an outbox that is dead-lettered or still waiting on its backoff.
+     * those with an outbox that is dead-lettered or has a next attempt time still to come.
+     * A completed outbox whose relay client set a next attempt time counts too.
      */
     private GroupHolds findGroupHolds(
       List<TB_Subscription_Outbox__c> outboxRecords
@@ -217,7 +218,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     /**
      * The message groups this run must not attempt.
      * The rest of a group cannot be processed once one of its outboxes is dead-lettered,
-     * waiting on a backoff, failed in this run, or passed over in this run.
+     * has a next attempt time still to come, failed in this run, or was passed over in this run.
      * The finalizer reads the same holds when it decides whether to queue another run.
      */
     private class GroupHolds {
