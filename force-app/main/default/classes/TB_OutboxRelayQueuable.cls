@@ -73,35 +73,11 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
         Object resolvedEvt = allResolvedMessages.get(item.Outbox_Message__c);
   
-        TB_OutboxRelayContext obCtx = new TB_OutboxRelayContext(
-          item,
-          resolvedEvt,
-          subDef
-        );
-  
-        try {
-          isFirst = false;
-          obCtx.setAttempt();
-  
-          // rethrow if we failed to resolve the message!
-          if (resolvedEvt != null && resolvedEvt instanceof Exception) {
-            throw (Exception) resolvedEvt;
-          }
-  
-          TB_IOutboxRelayClient client = TB_OutboxMetadataProvider.getSubscriptionRelayClient(
-            subDef
-          );
-          client.send(obCtx);
-          obCtx.setSuccess();
-        } catch (Exception e) {
-          obCtx.setError(e);
-          if (item.Group_Id__c != null) {
-            // cannot continue processing any other messages in this group
-            deadGroupIds.add(item.Group_Id__c);
-          }
-        } finally {
-          //TODO: should this be added before? What happens if limit exception is thrown?
-          finalizer.addResult(obCtx);
+        isFirst = false;
+        Boolean delivered = attemptRelay(item, resolvedEvt, subDef, finalizer);
+        if (!delivered && item.Group_Id__c != null) {
+          // cannot continue processing any other messages in this group
+          deadGroupIds.add(item.Group_Id__c);
         }
   
         // do not process any additional records
@@ -112,6 +88,47 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
       // attempt to save results with Lock
       finalizer.save();
+    }
+  
+    /**
+     * Makes one relay attempt for an outbox and hands the outcome to the finalizer.
+     * Returns whether the relay client took the message without throwing.
+     * A subscription config that cannot be read is thrown from here before the attempt is counted.
+     */
+    private Boolean attemptRelay(
+      TB_Subscription_Outbox__c item,
+      Object resolvedEvt,
+      TB_Message_Subscription__mdt subDef,
+      OutboxFinalizer finalizer
+    ) {
+      TB_OutboxRelayContext obCtx = new TB_OutboxRelayContext(
+        item,
+        resolvedEvt,
+        subDef
+      );
+  
+      Boolean delivered = false;
+      try {
+        obCtx.setAttempt();
+  
+        // rethrow if we failed to resolve the message!
+        if (resolvedEvt != null && resolvedEvt instanceof Exception) {
+          throw (Exception) resolvedEvt;
+        }
+  
+        TB_IOutboxRelayClient client = TB_OutboxMetadataProvider.getSubscriptionRelayClient(
+          subDef
+        );
+        client.send(obCtx);
+        obCtx.setSuccess();
+        delivered = true;
+      } catch (Exception e) {
+        obCtx.setError(e);
+      } finally {
+        //TODO: should this be added before? What happens if limit exception is thrown?
+        finalizer.addResult(obCtx);
+      }
+      return delivered;
     }
   
     /**
