@@ -8,14 +8,14 @@
 --   reported back to the framework
 -- Excludes:
 --   - Outbox lifecycle: fan-out, retries, backoff, dead-lettering, message
---     groups, time-to-live (outbox.allium)
+--     groups, time-to-live (transactional-outbox.allium)
 --   - Message resolution (the client receives the resolved payload, if any)
 --   - Credential storage and placeholder substitution in the endpoint and
 --     headers (platform feature)
 --   - Transport concerns: connection timeouts, TLS, redirects
 --   - The Case example under example/
 
-use "./outbox.allium" as outbox
+use "./transactional-outbox.allium" as outbox
 
 ------------------------------------------------------------
 -- External Entities
@@ -35,9 +35,17 @@ value HttpHeader {
 
 -- Per-subscription settings, read from the subscription's client settings.
 value HttpRelaySettings {
-    endpoint: String
+    endpoint: String?
     method: String?
     headers: Set<HttpHeader>
+
+    -- Both the endpoint and the method are required, and neither has a
+    -- default. The endpoint must be a web address or a reference to a
+    -- stored credential. The method must be an HTTP method name. Headers
+    -- are optional, but when given they must be name and value pairs.
+    is_valid:
+        endpoint != null and is_endpoint_format(endpoint)
+        and method != null and is_http_method(method)
 }
 
 value HttpResponse {
@@ -90,11 +98,10 @@ config {
     -- The relay client name a subscription uses to select this client.
     client_name: String = "TB_GenericHttpRelayClient"
 
-    default_method: String = "POST"
-
-    -- A response with a status code above this value means the subscriber
-    -- did not accept the message.
-    highest_accepted_status_code: Integer = 300
+    -- Only a response with a status code in this range means the subscriber
+    -- accepted the message.
+    lowest_accepted_status_code: Integer = 200
+    highest_accepted_status_code: Integer = 299
 }
 
 ------------------------------------------------------------
@@ -110,27 +117,47 @@ rule SendMessageOverHttp {
     -- subscription's client settings.
     let settings = http_settings(attempt.outbox.subscription.client_settings)
 
+    requires: settings.is_valid
+
     -- The resolved payload is preferred over the raw one. Text is sent
-    -- unchanged; any other structure is sent as its JSON encoding.
+    -- unchanged; any other structure is sent as its JSON encoding. A message
+    -- with neither is sent with an empty body.
     let body =
         if attempt.resolved_payload != null: as_body_text(attempt.resolved_payload)
-        else: attempt.outbox.message.payload
+        else: attempt.outbox.message.payload ?? ""
 
     ensures: HttpExchange.created(
         attempt: attempt,
         endpoint: settings.endpoint,
-        method: settings.method ?? config.default_method,
+        method: settings.method,
         headers: settings.headers,
         body: body,
         status: sent
     )
 }
 
+rule RejectInvalidSettings {
+    when: outbox/SendRequested(attempt)
+
+    requires: attempt.outbox.subscription.relay_client = config.client_name
+
+    let settings = http_settings(attempt.outbox.subscription.client_settings)
+
+    requires: not settings.is_valid
+
+    -- No request is made. The attempt fails like any other, so the outbox
+    -- retries and then dead-letters unless the settings are corrected.
+    -- settings_problem names the setting that is missing or malformed.
+    ensures: outbox/RelayFailed(attempt: attempt, reason: settings_problem(settings))
+}
+
 rule SubscriberAcceptsMessage {
     when: HttpResponseReceived(exchange, response)
 
     requires: exchange.status = sent
-    requires: response.status_code <= config.highest_accepted_status_code
+    requires:
+        response.status_code >= config.lowest_accepted_status_code
+        and response.status_code <= config.highest_accepted_status_code
 
     ensures: exchange.status = accepted
     ensures: exchange.response = response
@@ -141,7 +168,9 @@ rule SubscriberRejectsMessage {
     when: HttpResponseReceived(exchange, response)
 
     requires: exchange.status = sent
-    requires: response.status_code > config.highest_accepted_status_code
+    requires:
+        response.status_code < config.lowest_accepted_status_code
+        or response.status_code > config.highest_accepted_status_code
 
     ensures: exchange.status = rejected
     ensures: exchange.response = response
@@ -175,6 +204,16 @@ surface RelayRequests {
         -- RelayFailed. The client never reports success without a response
         -- from the subscriber.
 
+    @guarantee SettingsCheckedBeforeSending
+        -- The client checks the subscription's settings before it makes a
+        -- request. Settings it cannot use fail the attempt without
+        -- contacting the subscriber.
+
+    @guarantee ValidationMatchesSending
+        -- validate_settings rejects exactly the settings that would fail
+        -- this check: a missing or malformed endpoint, a missing or
+        -- malformed method, or headers that are not name and value pairs.
+
     @guarantee AttemptIsTraceable
         -- The attempt's log records the method, endpoint and body that were
         -- sent and the status code that came back. On success it also
@@ -191,11 +230,3 @@ surface SubscriberDelivery {
         HttpResponseReceived(exchange, response)
         HttpRequestFailed(exchange, reason)
 }
-
-------------------------------------------------------------
--- Open Questions
-------------------------------------------------------------
-
-open question "A response with status code exactly 300 is treated as accepted, and 301 and above as rejected. Was the intended boundary 'anything outside 2xx is a failure'?"
-open question "The endpoint setting is documented as required but nothing checks it. What should happen when a subscription has no endpoint: reject the configuration up front, or fail each attempt until the message is dead-lettered?"
-open question "When a message has no raw payload and no resolved payload, the request body is the JSON text null. Should an empty message be sent with an empty body, or not sent at all?"
