@@ -12,7 +12,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
       List<TB_Subscription_Outbox__c> outboxRecordsUnsorted = loadDueOutboxes();
   
-      Set<String> deadGroupIds = getDeadGroups(outboxRecordsUnsorted);
+      GroupHolds holds = findGroupHolds(outboxRecordsUnsorted);
   
       // Sort by Sequence Number
       List<TB_Subscription_Outbox__c> outboxRecords = TB_OutboxUtils.sortOutboxForProcessing(
@@ -46,15 +46,14 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
       OutboxFinalizer finalizer = new OutboxFinalizer(
         afterRelayActions,
-        deadGroupIds
+        holds
       );
       System.attachFinalizer(finalizer);
   
       Boolean isFirst = true;
       // Process Each Outbox
       for (TB_Subscription_Outbox__c item : outboxRecords) {
-        //check if item is part of a "deadlettered group"
-        if (item.Group_Id__c != null && deadGroupIds.contains(item.Group_Id__c)) {
+        if (holds.isHeld(item)) {
           continue;
         }
   
@@ -64,10 +63,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
         // DO NOT process isolated outbox unless it's first
         if (!isFirst && subDef.Isolate_Relay__c) {
-          if (item.Group_Id__c != null) {
-            // cannot continue processing any other messages in this group
-            deadGroupIds.add(item.Group_Id__c);
-          }
+          holds.hold(item);
           continue;
         }
   
@@ -75,9 +71,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
         isFirst = false;
         Boolean delivered = attemptRelay(item, resolvedEvt, subDef, finalizer);
-        if (!delivered && item.Group_Id__c != null) {
-          // cannot continue processing any other messages in this group
-          deadGroupIds.add(item.Group_Id__c);
+        if (!delivered) {
+          holds.hold(item);
         }
   
         // do not process any additional records
@@ -161,10 +156,10 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     }
   
     /**
-     * Dead groups are subscription message groups which have an item in the dead letter queue.
-     * We cannot continue processing the rest of the group until resolved
+     * Finds the groups that are held before the run attempts anything:
+     * those with an outbox that is dead-lettered or still waiting on its backoff.
      */
-    private Set<String> getDeadGroups(
+    private GroupHolds findGroupHolds(
       List<TB_Subscription_Outbox__c> outboxRecords
     ) {
       Set<String> activeGroupIds = new Set<String>();
@@ -188,7 +183,36 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         }
       }
   
-      return deadGroups;
+      return new GroupHolds(deadGroups);
+    }
+  
+    /**
+     * The message groups this run must not attempt.
+     * The rest of a group cannot be processed once one of its outboxes is dead-lettered,
+     * waiting on a backoff, failed in this run, or passed over in this run.
+     * The finalizer reads the same holds when it decides whether to queue another run.
+     */
+    private class GroupHolds {
+      private Set<String> groupIds;
+  
+      private GroupHolds(Set<String> groupIds) {
+        this.groupIds = groupIds;
+      }
+  
+      public Boolean isHeld(TB_Subscription_Outbox__c item) {
+        return item.Group_Id__c != null && groupIds.contains(item.Group_Id__c);
+      }
+  
+      /** An outbox with no group holds nothing. */
+      public void hold(TB_Subscription_Outbox__c item) {
+        if (item.Group_Id__c != null) {
+          groupIds.add(item.Group_Id__c);
+        }
+      }
+  
+      public Set<String> heldGroupIds() {
+        return groupIds;
+      }
     }
   
     /**
@@ -235,15 +259,15 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       private Map<Id, TB_OutboxRelayContext> results;
       private Set<Id> saved;
   
-      public Set<String> deadGroupIds;
+      private GroupHolds holds;
   
       private Map<String, TB_IAfterRelayAction> afterRelayActions = new Map<String, TB_IAfterRelayAction>();
   
       private OutboxFinalizer(
         Map<String, TB_IAfterRelayAction> afterRelayActions,
-        Set<String> deadGroupIds
+        GroupHolds holds
       ) {
-        this.deadGroupIds = deadGroupIds;
+        this.holds = holds;
         this.afterRelayActions = afterRelayActions;
         saved = new Set<Id>();
         results = new Map<Id, TB_OutboxRelayContext>();
@@ -305,6 +329,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         save();
   
         try {
+          Set<String> heldGroupIds = holds.heldGroupIds();
           TB_Subscription_Outbox__c[] activeOutboxItems = [
             SELECT Id
             FROM TB_Subscription_Outbox__c
@@ -313,7 +338,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
               AND Dead_Lettered__c = FALSE
               AND (Next_Attempt_Timestamp__c <= :System.now()
               OR Next_Attempt_Timestamp__c = NULL)
-              AND Group_Id__c NOT IN :deadGroupIds
+              AND Group_Id__c NOT IN :heldGroupIds
             LIMIT 1
           ];
           // more work to be done
