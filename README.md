@@ -150,7 +150,7 @@ A relay client must implement `costOfSend` as well as `send`:
 TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription);
 ```
 
-It returns the most that one call to `send` for that subscription will use. Set every field of `TB_SendCost`. Use 0 for anything a send does not use.
+It returns the most that one call to `send` for that subscription will use. Set every field of `TB_SendCost`. Use 0 for anything a send does not use. A cost with a field left null is not a valid declaration, and null does not mean 0.
 
 | Field | What it counts |
 |---|---|
@@ -162,13 +162,17 @@ It returns the most that one call to `send` for that subscription will use. Set 
 | `dmlRows` | Rows those statements write |
 | `eventPublishes` | Platform events published immediately |
 | `cpuTimeMs` | CPU time, in milliseconds |
-| `heapBytes` | Heap, in bytes |
+| `heapBytes` | Heap, in bytes. This is the highest the send raises the heap above where it stood when the send began, at any point during the send, including what it still holds when it returns. |
 
 The relay run will use this to decide whether it has room for another attempt before it starts one. It does not read the value yet.
 
 `TB_GenericHttpRelayClient` states one callout lasting up to its 10 second timeout, and no queries, writes or event publishes.
 
-**This is a breaking change.** `costOfSend` was added to `TB_IOutboxRelayClient`. A relay client written before this change no longer compiles until it adds the method. To upgrade, add `costOfSend` to each of your relay clients and return the cost of what its `send` does. For example, a client that sends one HTTP request with a 30 second timeout and runs one query that returns one row before sending. The CPU and heap figures here are only an example. Measure your own client by reading `Limits.getCpuTime()` and `Limits.getHeapSize()` before and after a send with the largest message you expect.
+**This is a breaking change.** `costOfSend` was added to `TB_IOutboxRelayClient`. A relay client written before this change no longer compiles until it adds the method. To upgrade, add `costOfSend` to each of your relay clients and return the cost of what its `send` does. Deploy your updated relay clients in the same deployment as this version, so the interface and every class that implements it change together.
+
+Measure your own client with the largest message and response you expect. For CPU, read `Limits.getCpuTime()` before and after a send. For heap, a reading of `Limits.getHeapSize()` before and after a send shows only what the send still holds when it returns. The heap can be higher partway through the send, for example while it holds a response and copies of the response body at once. Read `Limits.getHeapSize()` inside `send` at the point where it holds the most. Then add the size of any large strings a single statement builds, such as joining a body onto a log line, because a reading taken after that statement does not show them.
+
+The example below is for a client that sends one HTTP request with a 30 second timeout and runs one query that returns one row before sending. Its CPU and heap figures are only an example.
 
 ```java
 public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
