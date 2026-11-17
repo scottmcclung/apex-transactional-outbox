@@ -119,15 +119,6 @@ public class TB_TransactionOutboxTestUtils {
         }
     }
 
-    @testVisible
-    static Integer throwingActionCalls = 0;
-    public class ThrowingAction implements TB_IAfterRelayAction {
-        public void execute(TB_OutboxRelayContext[] ctx) {
-            throwingActionCalls++;
-            throw new TestException('Action Error');
-        }
-    }
-
     public class TestException extends Exception {
     }
 }
