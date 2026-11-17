@@ -9,7 +9,9 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      *
      * Before each attempt it asks the relay client what one send needs, and compares that with what the
      * run has left of each limit it works within. An outbox it has no room for is passed over: it is not
-     * charged an attempt and is left as it is, and the run goes on to the next outbox. If a send reaches
+     * charged an attempt and is left as it is, and the run goes on to the next outbox. The run's first
+     * attempt is not checked for room. A run that could attempt nothing would leave every outbox as it
+     * was, and its finalizer would queue the next run in the same state, without end. If a send reaches
      * a limit anyway and the platform's error can be caught, that attempt is abandoned and the run starts
      * nothing more. Either way the run ends normally, saves its outcomes, and its finalizer queues the
      * next run. A limit the platform does not let code catch still ends the run part-way, and the
@@ -181,13 +183,16 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     }
 
     /**
-     * Makes one relay attempt for an outbox when the run has room for it, and hands the outcome to the
-     * finalizer. The attempt is delivered when it finished without an exception, and failed otherwise.
+     * Makes one relay attempt for an outbox when the run has room for it or has not started an attempt
+     * yet, and hands the outcome to the finalizer. The attempt is delivered when it finished without an exception, and failed otherwise.
      *
      * The relay client is built and asked what one send needs before the attempt is counted. When the
      * run has too little left of any limit for that, nothing is attempted and the outbox is not handed
-     * to the finalizer, so it stays as it is. A client that cannot be built, or whose cost cannot be
-     * used, fails the counted attempt before anything is sent, like any other fault of the client.
+     * to the finalizer, so it stays as it is. The run's first attempt goes ahead without that check,
+     * so a run that reaches an outbox it could send never ends having sent nothing for lack of room.
+     * A client that cannot be built, or whose cost cannot be used, fails the counted attempt before
+     * anything is sent, like any other fault of the client. That attempt never reached the room
+     * check, so the run's first attempt is still to come.
      *
      * A subscription config that cannot be read fails the counted attempt before anything is sent,
      * and the outbox waits on its subscription's backoff like any failed attempt.
@@ -208,7 +213,10 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       TB_IOutboxRelayClient client;
       try {
         client = TB_OutboxMetadataProvider.getSubscriptionRelayClient(subDef);
-        if (!budget.hasRoomFor(declaredCostOfSend(client, subDef))) {
+        // Read before the first-attempt rule is applied, so a declaration that cannot be used fails
+        // the first attempt too.
+        TB_SendCost cost = declaredCostOfSend(client, subDef);
+        if (budget.hasStartedAnAttempt() && !budget.hasRoomFor(cost)) {
           return AttemptOutcome.NO_ROOM;
         }
       } catch (Exception e) {
@@ -217,6 +225,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         finalizer.addResult(obCtx);
         return AttemptOutcome.FAILED;
       }
+      budget.attemptStarted();
 
       // A client may replace the TTL during its send, and an abandoned attempt must not keep that.
       Datetime ttlBeforeAttempt = item.TTL__c;
@@ -399,10 +408,26 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      *
      * Nothing is kept back for the save at the end of the run. If that save goes over a limit, the
      * finalizer saves the outcomes in its own transaction.
+     *
+     * The room check applies from the run's second attempt on. The first attempt goes ahead whatever
+     * is left, because a run that attempted nothing would be queued again in the same state. At worst
+     * that one send overruns a limit, and the attempt is abandoned or the job fails.
      */
     private class RunBudget {
       // System.currentTimeMillis() when the budget began.
       private Long startedAtMs = System.currentTimeMillis();
+      // Whether this run has started an attempt that got past the room check, whatever then became
+      // of its send. An outbox failed before that point, because its client could not be built or
+      // its cost could not be used, leaves the first attempt still to come.
+      private Boolean anAttemptHasStarted = false;
+
+      public Boolean hasStartedAnAttempt() {
+        return anAttemptHasStarted;
+      }
+
+      public void attemptStarted() {
+        anAttemptHasStarted = true;
+      }
 
       public Boolean hasRoomFor(TB_SendCost cost) {
         return hasBudgetFor(cost, left());
@@ -826,9 +851,11 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
 
         // This counts toward isolation even when the run then has no room for the send, although an
         // outbox passed over is not an attempt. The plan cannot know about room, and counting it the
-        // same way keeps the run to outboxes the plan resolved messages for. So an isolated outbox
-        // behind one passed over for lack of room waits for a run in which it is first, and an
-        // isolated outbox passed over for lack of room still ends normal attempts for this run.
+        // same way keeps the run to outboxes the plan resolved messages for. It changes nothing in
+        // practice: the run's first attempt is not checked for room, so an outbox passed over for
+        // lack of room always comes after a started attempt, which had already ended isFirst. For
+        // the same reason an isolated outbox, which gets here only while isFirst holds, is never
+        // passed over for lack of room.
         isFirst = false;
         if (subDef.Isolate_Relay__c) {
           isolatedAttempted = true;

@@ -164,7 +164,7 @@ It returns the most that one call to `send` for that subscription will use. Set 
 | `cpuTimeMs` | CPU time, in milliseconds |
 | `heapBytes` | Heap, in bytes. This is the highest the send raises the heap above where it stood when the send began, at any point during the send, including what it still holds when it returns. |
 
-The relay run uses this to decide whether it has room for another attempt before it starts one.
+The relay run uses this to decide whether it has room for another attempt before it starts one. A run always starts its first attempt, and checks for room from the second attempt on. A run that could attempt nothing would be queued again in the same state. So the outboxes of a client whose declared cost can never fit in a run are still attempted, one per run, each as that run's first attempt. Outboxes of other clients that do fit can follow it in the same run.
 
 `TB_GenericHttpRelayClient` states one callout lasting up to its 10 second timeout, and no queries, writes or event publishes.
 
@@ -251,7 +251,7 @@ A run stops by itself when it has no callouts left, so a batch size above 100 do
 
 An outbox that is already held when the run starts does not count toward the batch size. An outbox that becomes held during the run, because an earlier message in its group failed, has already been chosen. It is not attempted and its place is not given to another outbox. A run reads up to 10 pages of due outboxes, each twice the batch size, while it looks for outboxes it can attempt.
 
-Before each attempt the run compares the relay client's `costOfSend` with what it has left of each limit. An outbox it has no room for is left as it is, without being charged an attempt, and the next run takes it up.
+Before each attempt after its first, the run compares the relay client's `costOfSend` with what it has left of each limit. An outbox it has no room for is left as it is, without being charged an attempt, and stays due for a later run. The first attempt is not checked, so every run that reaches an outbox it can send attempts at least one. If that one send needs more than the run has left, it can reach a limit, with the results described below.
 
 The platform does not report how much callout time a transaction has used, so the run counts time on the clock from just before it calls the message resolvers. Time spent in resolvers and in any other processing from then on counts against the 120 seconds, as well as time spent waiting on callouts.
 

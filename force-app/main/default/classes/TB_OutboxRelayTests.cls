@@ -3658,7 +3658,8 @@ public class TB_OutboxRelayTests {
 
     /**
      * One send that needs more of a limit than any transaction is allowed can never fit, whatever
-     * the run has used. The outbox ahead of it is affordable, so the run has an outcome to save.
+     * the run has used. The outbox ahead of it is affordable, so the run has an outcome to save, and
+     * the costly one is not the run's first attempt, which is not checked for room.
      */
     static void assertOutboxIsPassedOverWhenOneSendNeeds(String field, Integer amount) {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
@@ -3737,20 +3738,139 @@ public class TB_OutboxRelayTests {
         assertOutboxIsPassedOverWhenOneSendNeeds('heapBytes', 1000000000);
     }
 
+    static TB_SendCost moreCalloutsThanARunHas() {
+        return TB_TransactionOutboxTestUtils.sendCostWith('callouts', 101);
+    }
+
     /**
-     * Each outbox is judged on its own cost when its turn comes. One that does not fit does not end
-     * the run for a later one that does.
+     * A run that could attempt nothing would leave everything as it was, and be queued again in the
+     * same state. So a run always starts its first attempt, whatever the send declares.
      */
     @isTest
-    static void testWhenOutboxWithNoRoomIsAheadOfOneWithRoomThenTheLaterOneIsStillAttempted() {
+    static void testWhenTheOnlyOutboxNeedsMoreThanARunHasThenItIsStillAttempted() {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
         TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
-        addDeclaredCostSubscription(
-            app,
-            msgDef,
-            'a_costly_feed',
-            TB_TransactionOutboxTestUtils.sendCostWith('callouts', 101)
+        addDeclaredCostSubscription(app, msgDef, 'costly_feed', moreCalloutsThanARunHas());
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The run\'s first attempt should start without a room check');
+        System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'The send went through, so it should be delivered');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'The client should be called once');
+    }
+
+    /**
+     * An outbox failed for missing configuration starts no send, so it does not use up the run's
+     * first attempt. The first outbox that can be sent still gets it.
+     */
+    @isTest
+    static void testWhenFirstSendableOutboxNeedsMoreThanARunHasThenItIsStillAttempted() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt removedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt removed = addTestClientSubscription(app, removedDef, 'billing_feed');
+        TB_Message_Definition__mdt costlyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addDeclaredCostSubscription(app, costlyDef, 'costly_feed', moreCalloutsThanARunHas());
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(removedDef), newMessage(costlyDef) };
+        removeSubscription(removed);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Both outboxes should be attempted');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with no subscription should not be delivered');
+        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The costly outbox should be delivered');
+    }
+
+    /** The first attempt is not checked for room, and once started it ends like any other attempt. */
+    @isTest
+    static void testWhenFirstAttemptNeedsMoreThanARunHasAndItsResolverFailedThenTheFailureIsRecorded() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        msgDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.ThrowingResolver';
+        addDeclaredCostSubscription(app, msgDef, 'costly_feed', moreCalloutsThanARunHas()).Retry_BackOff__c = '30';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertNotEquals(null, outbox.Last_Error_Message__c, 'The resolver failure should be recorded');
+        System.assert(
+            outbox.Last_Error_Message__c.contains('Resolver Error'),
+            'The error should be the resolver failure, but is: ' + outbox.Last_Error_Message__c
         );
+        assertNextAttemptIsInMinutes(outbox, 30, 'A failed attempt should wait on its subscription\'s backoff.');
+    }
+
+    /** Only the first attempt goes ahead without room. Every outbox after it is checked. */
+    @isTest
+    static void testWhenLaterOutboxesNeedMoreThanARunHasThenTheyArePassedOverAfterTheFirstAttempt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addDeclaredCostSubscription(app, msgDef, 'a_costly_feed', moreCalloutsThanARunHas());
+        addDeclaredCostSubscription(app, msgDef, 'b_costly_feed', moreCalloutsThanARunHas()).Retry_BackOff__c = '30';
+        addDeclaredCostSubscription(app, msgDef, 'c_costly_feed', moreCalloutsThanARunHas()).Retry_BackOff__c = '30';
+        addTestClientSubscription(app, msgDef, 'd_affordable_feed');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'The run\'s first attempt should start without a room check');
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The first attempt should be delivered');
+        assertOutboxIsUntouched(outboxes[1], 'The run has no room for a second costly send.');
+        assertOutboxIsUntouched(outboxes[2], 'The run has no room for a third costly send.');
+        System.assertNotEquals(null, outboxes[3].Completed_Timestamp__c, 'The affordable outbox should still be delivered');
+        System.assertEquals(2, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only two outboxes should reach a client');
+    }
+
+    /**
+     * Every send declares more than a run can have. Each run attempts one outbox, its first, so the
+     * backlog shrinks by one per run and the runs end when nothing is left.
+     */
+    @isTest
+    static void testWhenEverySendNeedsMoreThanARunHasThenEachRunAttemptsOneAndTheRunsEnd() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addDeclaredCostSubscription(app, msgDef, 'costly_feed', moreCalloutsThanARunHas());
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(msgDef) };
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        stopTestExpectingNoFailedJob();
+
+        System.assertEquals(
+            new List<Integer>{ 1, 1 },
+            attemptsInOrder(),
+            'Each of the two runs should attempt one outbox'
+        );
+        System.assertEquals(2, relayJobCount(), 'The first run should queue a second for the outbox it passed over');
+        for (TB_Subscription_Outbox__c outbox : outboxesInOrder()) {
+            System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'Every outbox should be delivered across the two runs');
+        }
+        System.assertEquals(
+            0,
+            [SELECT COUNT() FROM TB_Subscription_Outbox__c WHERE Completed_Timestamp__c = NULL],
+            'No outbox should be left due, so no further run is queued'
+        );
+    }
+
+    /**
+     * An isolated outbox at the front of the run is the run's first attempt, so it is attempted even
+     * when it declares more than the run has. The outbox behind it is passed over for isolation.
+     */
+    @isTest
+    static void testWhenIsolatedOutboxAtTheFrontNeedsMoreThanARunHasThenItIsAttempted() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addDeclaredCostSubscription(app, msgDef, 'a_isolated_feed', moreCalloutsThanARunHas()).Isolate_Relay__c = true;
         addTestClientSubscription(app, msgDef, 'b_affordable_feed');
 
         Test.startTest();
@@ -3758,18 +3878,109 @@ public class TB_OutboxRelayTests {
         stopTestExpectingNoFailedJob();
 
         List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
-        assertOutboxIsUntouched(outboxes[0], 'The run has no room for the costly send.');
-        System.assertEquals(1, outboxes[1].Relay_Attempts__c, 'The affordable outbox behind it should be attempted');
-        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The affordable outbox behind it should be delivered');
+        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'The isolated outbox should be attempted');
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The isolated outbox should be delivered');
+        assertOutboxIsUntouched(outboxes[1], 'The run attempts nothing after an isolated outbox.');
+    }
+
+    /**
+     * The first attempt skips only the room check. A cost declaration that cannot be used still fails
+     * a counted attempt, and starts no send, so the next outbox is the first to start one.
+     */
+    @isTest
+    static void testWhenFirstOutboxHasAnUnusableCostThenTheNextIsAttemptedWithoutARoomCheck() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt faulty = TB_TransactionOutboxTestUtils.addSubscription(app, msgDef, 'a_faulty_feed');
+        faulty.Relay_Client__c = DECLARED_COST_CLIENT;
+        faulty.Config__c = '{}';
+        faulty.Retry_BackOff__c = '25';
+        addDeclaredCostSubscription(app, msgDef, 'b_costly_feed', moreCalloutsThanARunHas());
+        addDeclaredCostSubscription(app, msgDef, 'c_costly_feed', moreCalloutsThanARunHas());
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'The attempt with the unusable cost should be counted');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with the unusable cost should not be delivered');
+        System.assert(
+            outboxes[0].Last_Error_Message__c != null && outboxes[0].Last_Error_Message__c.contains(DECLARED_COST_CLIENT),
+            'The error should name the relay client, but is: ' + outboxes[0].Last_Error_Message__c
+        );
+        assertNextAttemptIsInMinutes(outboxes[0], 25, 'The outbox should wait on its subscription\'s backoff.');
+        System.assertEquals(1, outboxes[1].Relay_Attempts__c, 'The first outbox to start a send should not be checked for room');
+        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The first outbox to start a send should be delivered');
+        assertOutboxIsUntouched(outboxes[2], 'The run has no room for a second costly send.');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only one outbox should reach its client');
+    }
+
+    /** An abandoned first attempt ends the run like any abandoned attempt. */
+    @isTest
+    static void testWhenFirstAttemptNeedsMoreThanARunHasAndHitsTheCalloutTimeLimitThenNothingMoreIsStarted() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt limitDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addDeclaredCostSubscription(app, limitDef, 'costly_feed', moreCalloutsThanARunHas()).Retry_BackOff__c = '30';
+        TB_Message_Definition__mdt otherDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, otherDef, 'other_feed');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newMessage(limitDef, TB_TransactionOutboxTestUtils.CALLOUT_TIME_LIMIT_PAYLOAD),
+            newMessage(otherDef)
+        };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertNotEquals(null, outboxes[0].Last_Attempt__c, 'The first attempt should have started');
+        System.assertEquals(0, outboxes[0].Relay_Attempts__c, 'An attempt that hit a run limit should not be counted');
+        System.assertEquals(null, outboxes[0].Last_Error_Message__c, 'No error should be recorded against the outbox');
+        System.assertEquals(null, outboxes[0].Next_Attempt_Timestamp__c, 'No wait should be added');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox should not be delivered');
+        assertOutboxIsUntouched(outboxes[1], 'The run reached a limit before this outbox\'s turn.');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the abandoned attempt should reach a client');
+    }
+
+    /**
+     * Each outbox is judged on its own cost when its turn comes. One that does not fit does not end
+     * the run for a later one that does. An affordable outbox goes first, because a run's first
+     * attempt is not checked for room.
+     */
+    @isTest
+    static void testWhenOutboxWithNoRoomIsAheadOfOneWithRoomThenTheLaterOneIsStillAttempted() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'a_affordable_feed');
+        addDeclaredCostSubscription(
+            app,
+            msgDef,
+            'b_costly_feed',
+            TB_TransactionOutboxTestUtils.sendCostWith('callouts', 101)
+        );
+        addTestClientSubscription(app, msgDef, 'c_affordable_feed');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The first affordable outbox should be delivered');
+        assertOutboxIsUntouched(outboxes[1], 'The run has no room for the costly send.');
+        System.assertEquals(1, outboxes[2].Relay_Attempts__c, 'The affordable outbox behind it should be attempted');
+        System.assertNotEquals(null, outboxes[2].Completed_Timestamp__c, 'The affordable outbox behind it should be delivered');
     }
 
     /**
      * An outbox passed over for lack of room is still undelivered, so the messages after it in its
-     * group wait for it, even when the run has room for them.
+     * group wait for it, even when the run has room for them. An affordable message goes first,
+     * because a run's first attempt is not checked for room.
      */
     @isTest
     static void testWhenGroupedOutboxIsPassedOverForLackOfRoomThenLaterMessagesInItsGroupAreHeld() {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt firstDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message0');
+        addTestClientSubscription(app, firstDef, 'first_feed');
         TB_Message_Definition__mdt costlyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
         addDeclaredCostSubscription(
             app,
@@ -3782,15 +3993,17 @@ public class TB_OutboxRelayTests {
 
         Test.startTest();
         insert new List<TB_Outbox_Message__c>{
+            newMessage(firstDef),
             newGroupedMessage(costlyDef, 'group1'),
             newGroupedMessage(affordableDef, 'group1')
         };
         stopTestExpectingNoFailedJob();
 
         List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
-        assertOutboxIsUntouched(outboxes[0], 'The run has no room for the costly send.');
-        assertOutboxIsUntouched(outboxes[1], 'The message before it in its group was passed over.');
-        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The first outbox should be delivered');
+        assertOutboxIsUntouched(outboxes[1], 'The run has no room for the costly send.');
+        assertOutboxIsUntouched(outboxes[2], 'The message before it in its group was passed over.');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the first outbox should be sent');
     }
 
     /**
@@ -4204,11 +4417,14 @@ public class TB_OutboxRelayTests {
 
     /**
      * The room check comes before the attempt, and a failed resolution only fails an attempt that has
-     * started. An outbox the run has no room for is passed over, whatever its resolver did.
+     * started. An outbox the run has no room for is passed over, whatever its resolver did. An
+     * affordable message goes first, because a run's first attempt is not checked for room.
      */
     @isTest
     static void testWhenResolverFailsAndRunHasNoRoomForTheSendThenOutboxIsUntouched() {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt firstDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message0');
+        addTestClientSubscription(app, firstDef, 'first_feed');
         TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
         msgDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.ThrowingResolver';
         // A backoff, so a wait would show if the resolver failure were recorded.
@@ -4221,11 +4437,13 @@ public class TB_OutboxRelayTests {
             .Retry_BackOff__c = '30';
 
         Test.startTest();
-        insert newMessage(msgDef);
+        insert new List<TB_Outbox_Message__c>{ newMessage(firstDef), newMessage(msgDef) };
         stopTestExpectingNoFailedJob();
 
-        assertOutboxIsUntouched(outboxesInOrder()[0], 'The run has no room for the send.');
-        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The first outbox should be delivered');
+        assertOutboxIsUntouched(outboxes[1], 'The run has no room for the send.');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the first outbox should be sent');
     }
 
     /**

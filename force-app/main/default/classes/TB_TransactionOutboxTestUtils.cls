@@ -131,7 +131,8 @@ public class TB_TransactionOutboxTestUtils {
 
     /**
      * Declares the cost its subscription's settings hold under "cost", and uses none of it.
-     * Settings with no "cost" make it declare nothing at all.
+     * Settings with no "cost" make it declare nothing at all. Every send of the callout time
+     * payload fails the way the platform fails a callout once the run's callout time is used up.
      */
     public class DeclaredCostClient implements TB_IOutboxRelayClient {
         public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
@@ -145,6 +146,9 @@ public class TB_TransactionOutboxTestUtils {
         public void send(TB_OutboxRelayContext ctx) {
             sentMessages.add(ctx.resolvedMessage);
             clearRunGuardIfAsked();
+            if (ctx.outbox.Outbox_Message__r.Message__c == CALLOUT_TIME_LIMIT_PAYLOAD) {
+                throw new CalloutException(CALLOUT_TIME_LIMIT_ERROR);
+            }
         }
     }
 
