@@ -16,10 +16,14 @@ public class TB_OutboxRelayContext {
 
     /**
      * The Configuration field from the subscription after being passed through `JSON.deserializeUntyped`.
-     * Null when the subscription is null.
+     * Null when the subscription is null, or when its Configuration field cannot be read as a JSON object.
      */
     public Map<String, Object> subscriptionConfig;
-    
+
+    // Why the subscription's Configuration field could not be read, or null when it could.
+    // Kept as text so the context stays serializable for the finalizer that holds it.
+    private String unreadableConfigReason;
+
     /* 
     * Populated by the IOutboxMessageResolver. Null if no resolver is configured.
     * WARNING: This must be Serializable!
@@ -40,8 +44,15 @@ public class TB_OutboxRelayContext {
         this.outbox = outbox;
         this.resolvedMessage = resolvedMessage;
         this.subscription = subscription;
+        // Settings that cannot be read belong to one subscription, so they must fail only the attempt
+        // that needs them. Building the context happens before the attempt is counted, so the problem
+        // is kept here and raised later by requireReadableConfig.
         if (subscription != null) {
-            this.subscriptionConfig = TB_OutboxMetadataProvider.getSubscriptionConfig(subscription);
+            try {
+                this.subscriptionConfig = TB_OutboxMetadataProvider.getSubscriptionConfig(subscription);
+            } catch (TB_OutboxMetadataProvider.TB_InvalidConfigException e) {
+                this.unreadableConfigReason = e.getMessage();
+            }
         }
 
         // The log holds what was written during the most recent attempt only, so it starts empty.
@@ -49,6 +60,17 @@ public class TB_OutboxRelayContext {
         this.outbox.Log__c = '';
         if (this.outbox.Relay_Attempts__c == null) {
             this.outbox.Relay_Attempts__c = 0;
+        }
+    }
+
+    /**
+     * The context is built before the attempt is counted and outside the attempt's error handling.
+     * Raising the failure from the constructor would leave the attempt uncounted and stop the run,
+     * so the attempt calls this once it has been counted.
+     */
+    public void requireReadableConfig() {
+        if (unreadableConfigReason != null) {
+            throw new TB_OutboxMetadataProvider.TB_InvalidConfigException(unreadableConfigReason);
         }
     }
 

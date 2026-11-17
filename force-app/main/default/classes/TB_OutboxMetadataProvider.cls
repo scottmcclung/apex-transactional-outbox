@@ -142,13 +142,20 @@ public class TB_OutboxMetadataProvider {
             return configCache.get(subscriptionDef.DeveloperName);
         }
 
+        // A field left empty means the subscription has no settings, which is valid.
         Map<String, Object> config = new Map<String, Object>();
         if (subscriptionDef.Config__c != null) {
+            Object parsed;
             try {
-                config = (Map<String, Object>) JSON.deserializeUntyped(subscriptionDef.Config__c);
+                parsed = JSON.deserializeUntyped(subscriptionDef.Config__c);
             } catch (Exception e) {
+                parsed = null;
+            }
+            // The JSON literal null parses without error to null, so it fails this check like any other non-object.
+            if (!(parsed instanceof Map<String, Object>)) {
                 throw new TB_InvalidConfigException('Invalid Config__c for subscription ' + subscriptionDef.DeveloperName + '. Must be a valid JSON object.');
             }
+            config = (Map<String, Object>) parsed;
         }
         configCache.put(subscriptionDef.DeveloperName, config);
         return config;
