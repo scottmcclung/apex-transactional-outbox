@@ -199,14 +199,12 @@ public class TB_OutboxMetadataProvider {
         return (TB_IOutboxMessageResolver) TB_OutboxUtils.constructFromName(def.Message_Resolver__c);
     }
 
-    public static Map<String, TB_IAfterRelayAction> getAfterRelayActionsMap(TB_Message_Subscription__mdt[] subsMdt) {
-        Map<String, TB_IAfterRelayAction> afterRelayActions = new Map<String, TB_IAfterRelayAction>();
-        for (TB_Message_Subscription__mdt sub : subsMdt) {
-            if (sub.After_Relay_Action__c != null) {
-                afterRelayActions.put(sub.DeveloperName, (TB_IAfterRelayAction) TB_OutboxUtils.constructFromName(sub.After_Relay_Action__c));
-            }
-        }
-        return afterRelayActions;
+    /**
+     * Throws when no class has this name, when the class is not an after-relay action, or when
+     * its constructor throws.
+     */
+    public static TB_IAfterRelayAction getAfterRelayAction(String className) {
+        return (TB_IAfterRelayAction) TB_OutboxUtils.constructFromName(className);
     }
 
     public class TB_InvalidConfigException extends Exception {}

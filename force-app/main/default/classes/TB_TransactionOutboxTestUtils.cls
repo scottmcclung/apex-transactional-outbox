@@ -98,7 +98,9 @@ public class TB_TransactionOutboxTestUtils {
         }
     }
 
-    // One entry per call to RecordingAction.execute, holding the argument as it was passed, null included.
+    // One entry per call to RecordingAction.execute, holding the argument as it was passed.
+    // The argument is recorded before it is read, so a null shows up here even though the action
+    // then throws on it.
     @testVisible
     static List<List<TB_OutboxRelayContext>> actionCalls = new List<List<TB_OutboxRelayContext>>();
     // For each call, how many of the outboxes it was given were already stored with their attempt counted.
@@ -108,23 +110,12 @@ public class TB_TransactionOutboxTestUtils {
         public void execute(TB_OutboxRelayContext[] ctx) {
             actionCalls.add(ctx);
             Set<Id> outboxIds = new Set<Id>();
-            if (ctx != null) {
-                for (TB_OutboxRelayContext item : ctx) {
-                    outboxIds.add(item.outbox.Id);
-                }
+            for (TB_OutboxRelayContext item : ctx) {
+                outboxIds.add(item.outbox.Id);
             }
             actionSavedCounts.add(
                 [SELECT COUNT() FROM TB_Subscription_Outbox__c WHERE Id IN :outboxIds AND Relay_Attempts__c > 0]
             );
-        }
-    }
-
-    @testVisible
-    static Integer throwingActionCalls = 0;
-    public class ThrowingAction implements TB_IAfterRelayAction {
-        public void execute(TB_OutboxRelayContext[] ctx) {
-            throwingActionCalls++;
-            throw new TestException('Action Error');
         }
     }
 

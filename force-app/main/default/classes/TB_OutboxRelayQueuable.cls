@@ -38,15 +38,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         subscriptionNamesOf(outboxRecords)
       );
   
-      // Actions are built for every subscription of the run's message types, and also for a
-      // subscription that has moved to another definition but still has outboxes in this run.
-      Map<String, TB_Message_Subscription__mdt> actionSubscriptions = TB_OutboxMetadataProvider.getMessageSubscritionMap(
-        msgsByType.keySet()
-      );
-      actionSubscriptions.putAll(subscriptionsByName);
-  
       OutboxFinalizer finalizer = attachFinalizer(
-        actionSubscriptions.values(),
         holds,
         scanPageSize(batchSize)
       );
@@ -132,24 +124,14 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     }
   
     /**
-     * Builds the after-relay actions and attaches the finalizer before any attempt is made,
-     * so results are stored even if the run is stopped by a limit.
-     * An after-relay action class that cannot be built is thrown from here.
+     * Attaches the finalizer before any attempt is made, so results are stored even if the run
+     * is stopped by a limit.
      */
     private OutboxFinalizer attachFinalizer(
-      List<TB_Message_Subscription__mdt> subscriptions,
       GroupHolds holds,
       Integer scanPageSize
     ) {
-      Map<String, TB_IAfterRelayAction> afterRelayActions = TB_OutboxMetadataProvider.getAfterRelayActionsMap(
-        subscriptions
-      );
-  
-      OutboxFinalizer finalizer = new OutboxFinalizer(
-        afterRelayActions,
-        holds,
-        scanPageSize
-      );
+      OutboxFinalizer finalizer = new OutboxFinalizer(holds, scanPageSize);
       System.attachFinalizer(finalizer);
       return finalizer;
     }
@@ -562,16 +544,9 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       // The page size the run searched with, so the search for remaining work covers the same ground.
       private Integer scanPageSize;
   
-      private Map<String, TB_IAfterRelayAction> afterRelayActions = new Map<String, TB_IAfterRelayAction>();
-  
-      private OutboxFinalizer(
-        Map<String, TB_IAfterRelayAction> afterRelayActions,
-        GroupHolds holds,
-        Integer scanPageSize
-      ) {
+      private OutboxFinalizer(GroupHolds holds, Integer scanPageSize) {
         this.holds = holds;
         this.scanPageSize = scanPageSize;
-        this.afterRelayActions = afterRelayActions;
         saved = new Set<Id>();
         results = new Map<Id, TB_OutboxRelayContext>();
       }
@@ -649,13 +624,19 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         executeAfterActions();
       }
   
-      /** Run all After Relay Actions */
+      /**
+       * Calls the after-relay action of each subscription that had at least one attempt in this run,
+       * once, with that subscription's attempts. A subscription with no attempt gets no call, and
+       * its action is not built.
+       *
+       * An exception thrown while building or calling an action is caught and written to the debug
+       * log, and the other subscriptions' actions are still called.
+       *
+       * Actions run in the finalizer's transaction, after the results are saved and the next run is
+       * queued. A failure that cannot be caught, such as a governor limit, ends that transaction. The
+       * remaining actions are not called, and the saved results and the queued run are rolled back.
+       */
       private void executeAfterActions() {
-        if (afterRelayActions.isEmpty()) {
-          return;
-        }
-  
-        //group results by subscription__c
         Map<String, List<TB_OutboxRelayContext>> resultsBySubscription = new Map<String, List<TB_OutboxRelayContext>>();
         for (TB_OutboxRelayContext item : results.values()) {
           if (resultsBySubscription.containsKey(item.outbox.Subscription__c)) {
@@ -668,20 +649,52 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           }
         }
   
-        //run each after relay action
-        for (String subscriptionKey : afterRelayActions.keySet()) {
+        for (String subscriptionName : resultsBySubscription.keySet()) {
+          List<TB_OutboxRelayContext> attempts = resultsBySubscription.get(
+            subscriptionName
+          );
+          // Every attempt in the group carries the same subscription, or none when no subscription
+          // has the outbox's subscription name. An action belongs to a subscription, so none runs then.
+          TB_Message_Subscription__mdt subscription = attempts[0].subscription;
+          if (subscription == null || subscription.After_Relay_Action__c == null) {
+            continue;
+          }
+          String actionClassName = subscription.After_Relay_Action__c;
+
+          TB_IAfterRelayAction action;
           try {
-            TB_IAfterRelayAction action = afterRelayActions.get(subscriptionKey);
-            if (action != null) {
-              action.execute(resultsBySubscription.get(subscriptionKey));
-            }
+            action = TB_OutboxMetadataProvider.getAfterRelayAction(actionClassName);
           } catch (Exception e) {
-            // eat the exception.  They should have handled it themselves :(
             System.debug(
-              'Exception executing after relay action for subscription ' +
-              subscriptionKey
+              'Could not build after relay action ' +
+                actionClassName +
+                ' for subscription ' +
+                subscriptionName +
+                ': ' +
+                e.getTypeName() +
+                ': ' +
+                e.getMessage() +
+                '\n' +
+                e.getStackTraceString()
             );
-            System.debug(e);
+            continue;
+          }
+
+          try {
+            action.execute(attempts);
+          } catch (Exception e) {
+            System.debug(
+              'Exception executing after relay action ' +
+                actionClassName +
+                ' for subscription ' +
+                subscriptionName +
+                ': ' +
+                e.getTypeName() +
+                ': ' +
+                e.getMessage() +
+                '\n' +
+                e.getStackTraceString()
+            );
           }
         }
       }
