@@ -21,23 +21,28 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         executeStart
       );
   
-      Map<String, TB_Outbox_Message__c[]> msgsByType = groupMessagesByType(
-        outboxRecords
-      );
-  
       Map<String, TB_Message_Definition__mdt> definitionsByName = TB_OutboxMetadataProvider.getMessageDefintionMap();
+
+      // An outbox finds its subscription by name, whichever message definition that subscription is on now.
+      Map<String, TB_Message_Subscription__mdt> subscriptionsByName = TB_OutboxMetadataProvider.getSubscriptionsByName(
+        subscriptionNamesOf(outboxRecords)
+      );
+
+      Map<String, TB_Outbox_Message__c[]> msgsByType = groupMessagesByType(
+        plannedAttempts(
+          outboxRecords,
+          holds,
+          subscriptionsByName,
+          definitionsByName
+        )
+      );
 
       // transform DTO's
       Map<Id, Object> allResolvedMessages = resolveMessages(
         msgsByType,
         definitionsByName
       );
-  
-      // An outbox finds its subscription by name, whichever message definition that subscription is on now.
-      Map<String, TB_Message_Subscription__mdt> subscriptionsByName = TB_OutboxMetadataProvider.getSubscriptionsByName(
-        subscriptionNamesOf(outboxRecords)
-      );
-  
+
       OutboxFinalizer finalizer = attachFinalizer(
         holds,
         scanPageSize(batchSize)
@@ -75,14 +80,48 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     }
   
     /**
+     * The outboxes this run will attempt, as far as that is known before the first attempt.
+     * Any outbox the run attempts is in it, so its message reaches its resolver.
+     *
+     * It takes the same turns the run takes, starting from the holds the run has now. Whether a send
+     * fails is not known yet, so each planned attempt is counted as one that may fail. An outbox a
+     * failed send would hold is still planned, and the run may then not attempt it.
+     */
+    private static List<TB_Subscription_Outbox__c> plannedAttempts(
+      List<TB_Subscription_Outbox__c> outboxRecords,
+      GroupHolds holds,
+      Map<String, TB_Message_Subscription__mdt> subscriptionsByName,
+      Map<String, TB_Message_Definition__mdt> definitionsByName
+    ) {
+      RelayTurns plan = new RelayTurns(holds.copy());
+      List<TB_Subscription_Outbox__c> attempts = new List<TB_Subscription_Outbox__c>();
+      for (TB_Subscription_Outbox__c item : outboxRecords) {
+        TurnOutcome turn = plan.take(
+          item,
+          subscriptionsByName.get(item.Subscription__c),
+          definitionsByName.get(item.Outbox_Message__r.Type__c)
+        );
+        if (turn == TurnOutcome.ATTEMPT) {
+          attempts.add(item);
+          plan.sendMayFail(item);
+        }
+      }
+      return attempts;
+    }
+
+    /**
      * Message resolvers work on one message type at a time, in the order the outboxes will be processed.
-     * A message appears once for each of its outboxes.
+     * A message appears once, however many of its outboxes there are.
      */
     private Map<String, TB_Outbox_Message__c[]> groupMessagesByType(
       List<TB_Subscription_Outbox__c> outboxRecords
     ) {
       Map<String, TB_Outbox_Message__c[]> msgsByType = new Map<String, TB_Outbox_Message__c[]>();
+      Set<Id> grouped = new Set<Id>();
       for (TB_Subscription_Outbox__c item : outboxRecords) {
+        if (!grouped.add(item.Outbox_Message__c)) {
+          continue;
+        }
         if (!msgsByType.containsKey(item.Outbox_Message__r.Type__c)) {
           msgsByType.put(
             item.Outbox_Message__r.Type__c,
@@ -464,6 +503,16 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         return groupIds;
       }
   
+      /**
+       * The same holds, to be added to without changing these.
+       * It does not carry which groups have been looked up, so it is not for searching.
+       */
+      public GroupHolds copy() {
+        GroupHolds copied = new GroupHolds();
+        copied.heldFromSequence = heldFromSequence.clone();
+        return copied;
+      }
+
       private Long sequenceOf(TB_Subscription_Outbox__c item) {
         return Long.valueOf(item.Outbox_Message__r.Sequence_Number__c);
       }
@@ -483,9 +532,15 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      *
      * The decision rests on what came before in the run and on configuration, and not on how a send
      * turns out. The one outcome that changes later turns is a failed send, which the caller reports.
+     *
+     * Turns taken before any attempt, to plan the run, report each planned send as one that may fail
+     * instead. A turn that a failed send could hold may then come out differently in the run, so it
+     * is only allowed to rule out later attempts in ways that do not depend on it being reached.
      */
     private class RelayTurns {
       private GroupHolds holds;
+      // The holds that sends which may still fail would add. Only a plan has any.
+      private GroupHolds possibleHolds = new GroupHolds();
       private Boolean isFirst = true;
       // Once an isolated subscription has had an attempt, no outbox with configuration is attempted in this run.
       private Boolean isolatedAttempted = false;
@@ -509,7 +564,15 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         if (subDef == null || msgDef == null) {
           holds.hold(item);
           isFirst = false;
-          if (subDef != null && subDef.Isolate_Relay__c) {
+          // If a failed send holds this outbox instead, the run has already made an attempt and the
+          // group is already held from an earlier message, so the two lines above change nothing the
+          // run does not already have. Ending normal attempts is different, so a plan only does it
+          // when no send that may fail could hold this outbox.
+          if (
+            subDef != null &&
+            subDef.Isolate_Relay__c &&
+            !possibleHolds.isHeld(item)
+          ) {
             isolatedAttempted = true;
           }
           return TurnOutcome.NO_CONFIGURATION;
@@ -531,6 +594,11 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       /** A send that fails holds the messages after its outbox in its group. */
       public void sendFailed(TB_Subscription_Outbox__c item) {
         holds.hold(item);
+      }
+
+      /** For a plan: this outbox's send has not happened yet and may fail. */
+      public void sendMayFail(TB_Subscription_Outbox__c item) {
+        possibleHolds.hold(item);
       }
     }
   
