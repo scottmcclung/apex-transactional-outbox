@@ -2645,6 +2645,10 @@ public class TB_OutboxRelayTests {
 
     // Lets one subscription have a delivered attempt and a failed attempt in the same run.
     public class RefusesOnePayloadClient implements TB_IOutboxRelayClient {
+        public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
+            return TB_TransactionOutboxTestUtils.inMemorySendCost();
+        }
+
         public void send(TB_OutboxRelayContext ctx) {
             if (ctx.outbox.Outbox_Message__r.Message__c == FAILING_PAYLOAD) {
                 throw new TB_TransactionOutboxTestUtils.TestException('Test Error');

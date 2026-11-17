@@ -62,7 +62,31 @@ public class TB_TransactionOutboxTestUtils {
     // One entry per call to TestClient.send, holding the resolved message the client was given.
     @testVisible
     static List<Object> sentMessages = new List<Object>();
+
+    /**
+     * The cost of a send that only works in memory: no callouts, queries, writes or event publishes.
+     * The test clients append a short log line or keep a reference to the message, which stays well
+     * under 1 ms of CPU and 1 KB of heap.
+     */
+    public static TB_SendCost inMemorySendCost() {
+        TB_SendCost cost = new TB_SendCost();
+        cost.callouts = 0;
+        cost.calloutTimeMs = 0;
+        cost.queries = 0;
+        cost.queryRows = 0;
+        cost.dmlStatements = 0;
+        cost.dmlRows = 0;
+        cost.eventPublishes = 0;
+        cost.cpuTimeMs = 1;
+        cost.heapBytes = 1024;
+        return cost;
+    }
+
     public class TestClient implements TB_IOutboxRelayClient {
+        public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
+            return inMemorySendCost();
+        }
+
         public void send(TB_OutboxRelayContext ctx) {
             sentMessages.add(ctx.resolvedMessage);
             if (finalizerMayQueueNextRun) {
