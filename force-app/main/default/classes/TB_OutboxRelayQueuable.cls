@@ -43,26 +43,17 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         scanPageSize(batchSize)
       );
   
-      Boolean isFirst = true;
-      // Once an isolated subscription has had an attempt, no outbox with configuration is attempted in this run.
-      Boolean isolatedAttempted = false;
-      // Process Each Outbox
+      RelayTurns turns = new RelayTurns(holds);
       for (TB_Subscription_Outbox__c item : outboxRecords) {
-        if (holds.isHeld(item)) {
-          continue;
-        }
-  
         TB_Message_Subscription__mdt subDef = subscriptionsByName.get(
           item.Subscription__c
         );
         TB_Message_Definition__mdt msgDef = definitionsByName.get(
           item.Outbox_Message__r.Type__c
         );
-  
-        // Nothing is sent for an outbox without configuration, so isolation does not keep it from
-        // being failed. Its attempt still counts as one of the run's attempts, so an isolated outbox
-        // behind it is not first, and an isolated subscription it belongs to still ends normal attempts.
-        if (subDef == null || msgDef == null) {
+
+        TurnOutcome turn = turns.take(item, subDef, msgDef);
+        if (turn == TurnOutcome.NO_CONFIGURATION) {
           failWithoutConfiguration(
             item,
             subDef,
@@ -70,30 +61,12 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
             fallbackRetryWait,
             finalizer
           );
-          holds.hold(item);
-          isFirst = false;
-          if (subDef != null && subDef.Isolate_Relay__c) {
-            isolatedAttempted = true;
+        } else if (turn == TurnOutcome.ATTEMPT) {
+          Object resolvedEvt = allResolvedMessages.get(item.Outbox_Message__c);
+          Boolean delivered = attemptRelay(item, resolvedEvt, subDef, finalizer);
+          if (!delivered) {
+            turns.sendFailed(item);
           }
-          continue;
-        }
-  
-        // DO NOT process isolated outbox unless it's first
-        if (isolatedAttempted || (!isFirst && subDef.Isolate_Relay__c)) {
-          holds.hold(item);
-          continue;
-        }
-  
-        Object resolvedEvt = allResolvedMessages.get(item.Outbox_Message__c);
-  
-        isFirst = false;
-        Boolean delivered = attemptRelay(item, resolvedEvt, subDef, finalizer);
-        if (!delivered) {
-          holds.hold(item);
-        }
-  
-        if (subDef.Isolate_Relay__c) {
-          isolatedAttempted = true;
         }
       }
   
@@ -493,6 +466,71 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
       private Long sequenceOf(TB_Subscription_Outbox__c item) {
         return Long.valueOf(item.Outbox_Message__r.Sequence_Number__c);
+      }
+    }
+
+    /** What an outbox's turn in a run comes to. */
+    private enum TurnOutcome {
+      HELD,
+      NO_CONFIGURATION,
+      PASSED_OVER,
+      ATTEMPT
+    }
+
+    /**
+     * Decides what each outbox's turn in a run comes to, with the outboxes taken one at a time in
+     * publish order, and keeps what each turn leaves for the turns after it.
+     *
+     * The decision rests on what came before in the run and on configuration, and not on how a send
+     * turns out. The one outcome that changes later turns is a failed send, which the caller reports.
+     */
+    private class RelayTurns {
+      private GroupHolds holds;
+      private Boolean isFirst = true;
+      // Once an isolated subscription has had an attempt, no outbox with configuration is attempted in this run.
+      private Boolean isolatedAttempted = false;
+
+      private RelayTurns(GroupHolds holds) {
+        this.holds = holds;
+      }
+
+      public TurnOutcome take(
+        TB_Subscription_Outbox__c item,
+        TB_Message_Subscription__mdt subDef,
+        TB_Message_Definition__mdt msgDef
+      ) {
+        if (holds.isHeld(item)) {
+          return TurnOutcome.HELD;
+        }
+
+        // Nothing is sent for an outbox without configuration, so isolation does not keep it from
+        // being failed. Its attempt still counts as one of the run's attempts, so an isolated outbox
+        // behind it is not first, and an isolated subscription it belongs to still ends normal attempts.
+        if (subDef == null || msgDef == null) {
+          holds.hold(item);
+          isFirst = false;
+          if (subDef != null && subDef.Isolate_Relay__c) {
+            isolatedAttempted = true;
+          }
+          return TurnOutcome.NO_CONFIGURATION;
+        }
+
+        // An isolated outbox is attempted only as the run's first attempt.
+        if (isolatedAttempted || (!isFirst && subDef.Isolate_Relay__c)) {
+          holds.hold(item);
+          return TurnOutcome.PASSED_OVER;
+        }
+
+        isFirst = false;
+        if (subDef.Isolate_Relay__c) {
+          isolatedAttempted = true;
+        }
+        return TurnOutcome.ATTEMPT;
+      }
+
+      /** A send that fails holds the messages after its outbox in its group. */
+      public void sendFailed(TB_Subscription_Outbox__c item) {
+        holds.hold(item);
       }
     }
   
