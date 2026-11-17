@@ -3916,6 +3916,40 @@ public class TB_OutboxRelayTests {
         System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only one outbox should reach its client');
     }
 
+    /**
+     * The first attempt is used up once a send starts, whether or not it is delivered. After a send
+     * that failed, the next outbox is checked for room like any other.
+     */
+    @isTest
+    static void testWhenFirstSendStartsAndFailsThenTheNextOutboxIsCheckedForRoom() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt failing = addTestClientSubscription(app, msgDef, 'a_failing_feed');
+        failing.Config__c = '{"throwError":true}';
+        failing.Retry_BackOff__c = '25';
+        // A backoff, so a wait would show if the outbox were failed instead of passed over.
+        addDeclaredCostSubscription(app, msgDef, 'b_costly_feed', moreCalloutsThanARunHas()).Retry_BackOff__c = '30';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'The failed send should be counted');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The failed send should not be delivered');
+        System.assert(
+            outboxes[0].Last_Error_Message__c != null && outboxes[0].Last_Error_Message__c.contains('Test Error'),
+            'The error should be the client failure, but is: ' + outboxes[0].Last_Error_Message__c
+        );
+        assertNextAttemptIsInMinutes(outboxes[0], 25, 'The failed send should wait on its subscription\'s backoff.');
+        assertOutboxIsUntouched(outboxes[1], 'The run has no room for the costly send after a send has started.');
+        System.assertEquals(
+            1,
+            TB_TransactionOutboxTestUtils.sentMessages.size(),
+            'Only the failing outbox should reach its client'
+        );
+    }
+
     /** An abandoned first attempt ends the run like any abandoned attempt. */
     @isTest
     static void testWhenFirstAttemptNeedsMoreThanARunHasAndHitsTheCalloutTimeLimitThenNothingMoreIsStarted() {
@@ -4448,16 +4482,21 @@ public class TB_OutboxRelayTests {
 
     /**
      * Relays one outbox whose client logs, asks for a next attempt time and replaces the TTL before
-     * it runs out of callout time. The outbox got a TTL of an hour when it was created.
+     * it runs out of callout time. With createdWithTtl the outbox gets a TTL of an hour when it is
+     * created. Without it the outbox has no TTL until the client sets one.
      */
-    static TB_Subscription_Outbox__c relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit() {
+    static TB_Subscription_Outbox__c relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit(
+        Boolean createdWithTtl
+    ) {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
         TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
         TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(app, msgDef, 'shaping_feed');
         subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.ShapesOutcomeThenHitsCalloutTimeLimitClient';
         subscription.Retry_BackOff__c = '30';
-        subscription.Mark_TTL_Event__c = 'created';
-        subscription.TTL_Offset__c = 60;
+        if (createdWithTtl) {
+            subscription.Mark_TTL_Event__c = 'created';
+            subscription.TTL_Offset__c = 60;
+        }
 
         Test.startTest();
         insert newMessage(msgDef);
@@ -4475,7 +4514,7 @@ public class TB_OutboxRelayTests {
     /** A wait the client asked for is part of how the attempt turned out, and the attempt does not count. */
     @isTest
     static void testWhenAbandonedAttemptAskedForANextAttemptTimeThenItIsCleared() {
-        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit();
+        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit(true);
 
         System.assertEquals(null, outbox.Next_Attempt_Timestamp__c, 'The wait the client asked for should not be kept');
     }
@@ -4483,7 +4522,7 @@ public class TB_OutboxRelayTests {
     /** What the attempt logged shows how far it got before the run reached its limit. */
     @isTest
     static void testWhenAbandonedAttemptLoggedThenTheLogIsKept() {
-        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit();
+        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit(true);
 
         System.assertNotEquals(null, outbox.Log__c, 'What the attempt logged should be kept');
         System.assert(
@@ -4498,7 +4537,7 @@ public class TB_OutboxRelayTests {
      */
     @isTest
     static void testWhenAbandonedAttemptReplacedTheTtlThenTheEarlierTtlIsKept() {
-        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit();
+        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit(true);
 
         System.assertNotEquals(null, outbox.TTL__c, 'The TTL the outbox was created with should be kept');
         // A minute either side, because the trigger and the test read the clock at different moments.
@@ -4508,6 +4547,18 @@ public class TB_OutboxRelayTests {
                 TB_TransactionOutboxTestUtils.REQUESTED_TTL_DAYS +
                 ' days the client asked for, but it is ' +
                 outbox.TTL__c
+        );
+    }
+
+    /** An outbox that had no TTL before the abandoned attempt has none after it. */
+    @isTest
+    static void testWhenAbandonedAttemptSetATtlOnAnOutboxWithoutOneThenTheOutboxStillHasNoTtl() {
+        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit(false);
+
+        System.assertEquals(
+            null,
+            outbox.TTL__c,
+            'The TTL the client set during the abandoned attempt should not be kept'
         );
     }
 
