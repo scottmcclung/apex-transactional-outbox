@@ -3419,9 +3419,10 @@ public class TB_OutboxRelayTests {
     }
 
     /**
-     * The second message is held only because the first one's send fails. That is not known until
-     * after the first message is resolved, and a message type is resolved once in a run, so the
-     * second message is resolved with the first.
+     * Giving the held message to the resolver is not wanted for its own sake. It follows from how
+     * resolvers are called. The second message is held only because the first one's send fails, and
+     * the run cannot know that before it attempts the send. A resolver is called once per run, before
+     * any attempt, so the second message is given to it with the first and is then not sent.
      */
     @isTest
     static void testWhenGroupIsHeldByAFailedSendThenTheResolverWasStillGivenTheLaterMessagesInTheGroup() {
@@ -3450,6 +3451,107 @@ public class TB_OutboxRelayTests {
             new Map<String, List<String>>{ 'test.message1' => new List<String>{ 'first', 'second' } },
             resolverCallsByType(),
             'Both messages could be attempted when the run started, so both should be resolved together'
+        );
+        System.assertEquals(
+            new List<Object>{ 'resolved:first' },
+            TB_TransactionOutboxTestUtils.sentMessages,
+            'Only the first message should be sent. The held one should not reach the client'
+        );
+    }
+
+    /**
+     * Before any attempt, the run plans for each send failing, but a send that could fail is not a
+     * hold. Every message in the group is attempted when every send succeeds, so each must have
+     * been given to the resolver.
+     */
+    @isTest
+    static void testWhenEverySendInAGroupSucceedsThenEachMessageInTheGroupIsSentResolved() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = addRecordingResolverDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(msgDef, 'group1', 'first'),
+            newGroupedMessage(msgDef, 'group1', 'second'),
+            newGroupedMessage(msgDef, 'group1', 'third')
+        };
+        stopTestExpectingNoFailedJob();
+
+        System.assertEquals(new List<Integer>{ 1, 1, 1 }, attemptsInOrder(), 'Every message in the group should be attempted once');
+        for (TB_Subscription_Outbox__c outbox : outboxesInOrder()) {
+            System.assertNotEquals(
+                null,
+                outbox.Completed_Timestamp__c,
+                'Every message in the group should be delivered, but one carries: ' + outbox.Last_Error_Message__c
+            );
+        }
+        System.assertEquals(
+            new Map<String, List<String>>{ 'test.message1' => new List<String>{ 'first', 'second', 'third' } },
+            resolverCallsByType(),
+            'The resolver should be called once and given each message in the group once'
+        );
+        System.assertEquals(
+            new List<Object>{ 'resolved:first', 'resolved:second', 'resolved:third' },
+            TB_TransactionOutboxTestUtils.sentMessages,
+            'Each message should be sent as the resolver returned it'
+        );
+    }
+
+    /**
+     * An isolated subscription's outbox with no message definition ends what the run attempts, but
+     * only if the run reaches it. Here it is in a group behind a send that fails, so the group holds
+     * it and the run goes on to the ungrouped message after it. The run cannot know before attempting
+     * that the send will fail, so that later message must have been given to its resolver.
+     */
+    @isTest
+    static void testWhenAnIsolatedOutboxWithNoDefinitionIsHeldByAFailedSendThenTheMessageAfterItIsSentResolved() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt failingDef = addRecordingResolverDefinition('test.message1');
+        addTestClientSubscription(app, failingDef, 'billing_feed').Config__c = '{"throwError":true}';
+        TB_Message_Definition__mdt removed = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, removed, 'isolated_feed').Isolate_Relay__c = true;
+        TB_Message_Definition__mdt laterDef = addRecordingResolverDefinition('test.message3');
+        addTestClientSubscription(app, laterDef, 'shipping_feed');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(failingDef, 'group1', 'first'),
+            newGroupedMessage(removed, 'group1', 'second'),
+            newMessage(laterDef, 'third')
+        };
+        removeMessageDefinition(removed);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(3, outboxes.size(), 'Each message should have one outbox');
+        System.assertEquals('billing_feed', outboxes[0].Subscription__c, 'The failing outbox should be first in the run');
+        System.assertEquals('isolated_feed', outboxes[1].Subscription__c, 'The isolated outbox should be second in the run');
+        System.assertEquals('shipping_feed', outboxes[2].Subscription__c, 'The ungrouped outbox should be last in the run');
+        System.assertEquals(
+            new List<Integer>{ 1, 0, 1 },
+            attemptsInOrder(),
+            'The first send should fail, the isolated outbox should be held by it, and the last outbox should be attempted'
+        );
+        System.assert(
+            outboxes[0].Last_Error_Message__c.startsWith('Test Error'),
+            'The first message should fail in the relay client, but has: ' + outboxes[0].Last_Error_Message__c
+        );
+        System.assertEquals(null, outboxes[1].Last_Error_Message__c, 'The held outbox should carry no error');
+        System.assertNotEquals(null, outboxes[2].Completed_Timestamp__c, 'The last message should be delivered');
+        System.assertEquals(null, outboxes[2].Last_Error_Message__c, 'The last message should carry no error');
+        System.assertEquals(
+            new Map<String, List<String>>{
+                'test.message1' => new List<String>{ 'first' },
+                'test.message3' => new List<String>{ 'third' }
+            },
+            resolverCallsByType(),
+            'Each sent message should be given to its type\'s resolver'
+        );
+        System.assertEquals(
+            new List<Object>{ 'resolved:first', 'resolved:third' },
+            TB_TransactionOutboxTestUtils.sentMessages,
+            'Each sent message should be sent as its resolver returned it'
         );
     }
 
