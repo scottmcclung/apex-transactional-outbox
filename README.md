@@ -164,7 +164,7 @@ It returns the most that one call to `send` for that subscription will use. Set 
 | `cpuTimeMs` | CPU time, in milliseconds |
 | `heapBytes` | Heap, in bytes. This is the highest the send raises the heap above where it stood when the send began, at any point during the send, including what it still holds when it returns. |
 
-The relay run will use this to decide whether it has room for another attempt before it starts one. It does not read the value yet.
+The relay run uses this to decide whether it has room for another attempt before it starts one.
 
 `TB_GenericHttpRelayClient` states one callout lasting up to its 10 second timeout, and no queries, writes or event publishes.
 
@@ -251,7 +251,7 @@ Keep the batch size at or under 100 when relay clients make one callout per send
 
 An outbox that is already held when the run starts does not count toward the batch size. An outbox that becomes held during the run, because an earlier message in its group failed, has already been chosen. It is not attempted and its place is not given to another outbox. A run reads up to 10 pages of due outboxes, each twice the batch size, while it looks for outboxes it can attempt.
 
-The run does not yet check the remaining platform limits before each attempt. A run with slow subscribers can still use up the 120 seconds a transaction allows for callouts. If a limit is hit, the `TransactionalFinalizer` should result in the Relay Results being properly recorded.
+Before each attempt the run compares the relay client's `costOfSend` with what it has left of each limit. An outbox it has no room for is left as it is, without being charged an attempt, and the next run takes it up. If a limit is hit anyway, the `TransactionalFinalizer` should result in the Relay Results being properly recorded.
 
 ### Record Cleanup
 
