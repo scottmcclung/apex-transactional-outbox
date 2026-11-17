@@ -157,7 +157,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
     /**
      * Makes one relay attempt for an outbox and hands the outcome to the finalizer.
      * Returns whether the attempt finished without an exception.
-     * A subscription config that cannot be read is thrown from here before the attempt is counted.
+     * A subscription config that cannot be read fails the counted attempt before anything is sent,
+     * and the outbox waits on its subscription's backoff like any failed attempt.
      */
     private Boolean attemptRelay(
       TB_Subscription_Outbox__c item,
@@ -183,6 +184,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         TB_IOutboxRelayClient client = TB_OutboxMetadataProvider.getSubscriptionRelayClient(
           subDef
         );
+        obCtx.requireReadableConfig();
         client.send(obCtx);
         obCtx.setSuccess();
         delivered = true;
