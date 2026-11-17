@@ -541,6 +541,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       private GroupHolds holds;
       // The holds that sends which may still fail would add. Only a plan has any.
       private GroupHolds possibleHolds = new GroupHolds();
+      // An attempt that fails for missing configuration is still one of the run's attempts, so it
+      // keeps an isolated outbox after it from being first.
       private Boolean isFirst = true;
       // Once an isolated subscription has had an attempt, no outbox with configuration is attempted in this run.
       private Boolean isolatedAttempted = false;
@@ -614,8 +616,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       for (String msgType : msgsByType.keySet()) {
         TB_Message_Definition__mdt def = definitionsByLabel.get(msgType);
         TB_Outbox_Message__c[] msgs = msgsByType.get(msgType);
-        // A type with no definition has no resolver. Its outboxes fail without being sent.
-        if (def != null && def.Message_Resolver__c != null) {
+        // Only outboxes whose message type has a definition are planned, so def is never null here.
+        if (def.Message_Resolver__c != null) {
           try {
             TB_IOutboxMessageResolver resolver = TB_OutboxMetadataProvider.getMessageResolver(
               def
