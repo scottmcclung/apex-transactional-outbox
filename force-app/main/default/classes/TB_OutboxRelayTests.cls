@@ -460,8 +460,10 @@ public class TB_OutboxRelayTests {
                 Subscription__c,
                 Relay_Attempts__c,
                 Last_Error_Message__c,
+                Last_Attempt__c,
                 Completed_Timestamp__c,
-                Next_Attempt_Timestamp__c
+                Next_Attempt_Timestamp__c,
+                Dead_Lettered__c
             FROM TB_Subscription_Outbox__c
             ORDER BY Outbox_Message__r.Sequence_Number__c, Subscription__c
         ];
@@ -889,15 +891,31 @@ public class TB_OutboxRelayTests {
         System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The second run should deliver the isolated outbox');
     }
 
-    // Every test starts from the shipped batch size, whatever the org's own settings record holds.
+    static final Integer SHIPPED_RELAY_BATCH_SIZE = 100;
+    // In minutes. 12 hours.
+    static final Integer SHIPPED_FALLBACK_RETRY_WAIT = 720;
+
+    // Every test starts from the shipped settings, whatever the org's own settings record holds.
     static {
-        setRelayBatchSize(100);
+        setFrameworkSettings(SHIPPED_RELAY_BATCH_SIZE, SHIPPED_FALLBACK_RETRY_WAIT);
+    }
+
+    static void setFrameworkSettings(Integer batchSize, Integer fallbackRetryWait) {
+        TB_OutboxMetadataProvider.frameworkSettings = new List<TB_Framework_Settings__mdt>{
+            new TB_Framework_Settings__mdt(
+                DeveloperName = 'Default',
+                Relay_Batch_Size__c = batchSize,
+                Fallback_Retry_Wait__c = fallbackRetryWait
+            )
+        };
     }
 
     static void setRelayBatchSize(Integer batchSize) {
-        TB_OutboxMetadataProvider.frameworkSettings = new List<TB_Framework_Settings__mdt>{
-            new TB_Framework_Settings__mdt(DeveloperName = 'Default', Relay_Batch_Size__c = batchSize)
-        };
+        setFrameworkSettings(batchSize, SHIPPED_FALLBACK_RETRY_WAIT);
+    }
+
+    static void setFallbackRetryWait(Integer minutes) {
+        setFrameworkSettings(SHIPPED_RELAY_BATCH_SIZE, minutes);
     }
 
     static TB_Outbox_Message__c newGroupedMessage(TB_Message_Definition__mdt msgDef, String groupId) {
@@ -1286,5 +1304,615 @@ public class TB_OutboxRelayTests {
         System.assertNotEquals(null, failure, 'The run should fail and say why');
         System.assert(failure.contains('from 1 to 1000'), 'The error should give the allowed range: ' + failure);
         System.assertEquals(new List<Integer>{ 0 }, attemptsInOrder());
+    }
+
+    static void removeSubscription(TB_Message_Subscription__mdt subscription) {
+        for (Integer i = 0; i < TB_OutboxMetadataProvider.subscriptions.size(); i++) {
+            if (TB_OutboxMetadataProvider.subscriptions[i].DeveloperName == subscription.DeveloperName) {
+                TB_OutboxMetadataProvider.subscriptions.remove(i);
+                return;
+            }
+        }
+        System.assert(false, 'There is no subscription named ' + subscription.DeveloperName + ' to remove');
+    }
+
+    static void removeMessageDefinition(TB_Message_Definition__mdt msgDef) {
+        for (Integer i = 0; i < TB_OutboxMetadataProvider.msgDefinitions.size(); i++) {
+            if (TB_OutboxMetadataProvider.msgDefinitions[i].DeveloperName == msgDef.DeveloperName) {
+                TB_OutboxMetadataProvider.msgDefinitions.remove(i);
+                return;
+            }
+        }
+        System.assert(false, 'There is no message definition named ' + msgDef.DeveloperName + ' to remove');
+    }
+
+    // Stands in for attempts made by earlier runs.
+    static void setRelayAttempts(Integer position, Integer attempts) {
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[position];
+        outbox.Relay_Attempts__c = attempts;
+        update outbox;
+    }
+
+    // A minute either side, because the run and the test read the clock at different moments.
+    static void assertNextAttemptIsInMinutes(TB_Subscription_Outbox__c outbox, Integer minutes, String why) {
+        System.assertNotEquals(null, outbox.Next_Attempt_Timestamp__c, why + ' No next attempt time was set.');
+        System.assert(
+            Datetime.now().addMinutes(minutes - 1) < outbox.Next_Attempt_Timestamp__c &&
+                Datetime.now().addMinutes(minutes + 1) > outbox.Next_Attempt_Timestamp__c,
+            why +
+                ' Expected about ' +
+                minutes +
+                ' minutes from now, but the next attempt is at ' +
+                outbox.Next_Attempt_Timestamp__c
+        );
+    }
+
+    /**
+     * A publisher cannot create an outbox for a subscription or definition that does not exist,
+     * so each of these tests publishes first and takes the configuration away before the run starts.
+     */
+    @isTest
+    static void testWhenSubscriptionIsMissingThenOneAttemptFailsAndWaitsForTheFallback() {
+        setFallbackRetryWait(45);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+        // Its own backoff goes with it, so this must not be the wait that is used.
+        subscription.Retry_BackOff__c = '5';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        removeSubscription(subscription);
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertNotEquals(null, outbox.Last_Attempt__c, 'The time of the attempt should be recorded');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertNotEquals(null, outbox.Last_Error_Message__c, 'The reason should be recorded on the outbox');
+        System.assert(
+            outbox.Last_Error_Message__c.contains('billing_feed'),
+            'The error should name the missing subscription, but is: ' + outbox.Last_Error_Message__c
+        );
+        assertNextAttemptIsInMinutes(outbox, 45, 'A missing subscription should wait for the fallback retry wait.');
+        System.assertEquals(false, outbox.Dead_Lettered__c, 'One failed attempt of three should not dead-letter the outbox');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    @isTest
+    static void testWhenSubscriptionIsRenamedThenOneAttemptFailsUnderTheOldName() {
+        setFallbackRetryWait(45);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        subscription.DeveloperName = 'billing_feed_v2';
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered under another name');
+        System.assertNotEquals(null, outbox.Last_Error_Message__c, 'The reason should be recorded on the outbox');
+        System.assert(
+            outbox.Last_Error_Message__c.contains('billing_feed'),
+            'The error should name the subscription the outbox was created for, but is: ' + outbox.Last_Error_Message__c
+        );
+        assertNextAttemptIsInMinutes(outbox, 45, 'No subscription has the old name, so the fallback retry wait applies.');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    @isTest
+    static void testWhenMessageDefinitionIsMissingThenOneAttemptFailsAndWaitsForTheSubscriptionBackoff() {
+        setFallbackRetryWait(45);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+        subscription.Retry_BackOff__c = '30,60';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        removeMessageDefinition(msgDef);
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertNotEquals(null, outbox.Last_Attempt__c, 'The time of the attempt should be recorded');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertNotEquals(null, outbox.Last_Error_Message__c, 'The reason should be recorded on the outbox');
+        System.assert(
+            outbox.Last_Error_Message__c.contains('test.message1'),
+            'The error should name the message type that has no definition, but is: ' + outbox.Last_Error_Message__c
+        );
+        System.assert(
+            outbox.Last_Error_Message__c.containsIgnoreCase('definition'),
+            'The error should say a message definition is what is missing, but is: ' + outbox.Last_Error_Message__c
+        );
+        assertNextAttemptIsInMinutes(
+            outbox,
+            30,
+            'The subscription still exists, so its own backoff applies and the fallback does not.'
+        );
+        System.assertEquals(false, outbox.Dead_Lettered__c, 'One failed attempt of three should not dead-letter the outbox');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    @isTest
+    static void testWhenSubscriptionAndDefinitionAreBothMissingThenOneAttemptFailsAndWaitsForTheFallback() {
+        setFallbackRetryWait(45);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        removeSubscription(subscription);
+        removeMessageDefinition(msgDef);
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted once, not once for each missing part');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertNotEquals(null, outbox.Last_Error_Message__c, 'The reason should be recorded on the outbox');
+        assertNextAttemptIsInMinutes(outbox, 45, 'With no subscription there is no backoff, so the fallback applies.');
+    }
+
+    @isTest
+    static void testWhenSubscriptionIsMissingThenOtherOutboxesInTheRunAreRelayed() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt removed = addTestClientSubscription(app, msgDef, 'billing_feed');
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+
+        // The outbox with the missing subscription is published first, so the run reaches it first.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(healthyDef) };
+        removeSubscription(removed);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Both outboxes should be attempted in the one run');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with no subscription should not be delivered');
+        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The outbox behind it should be delivered');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the healthy outbox should be sent');
+    }
+
+    @isTest
+    static void testWhenMessageDefinitionIsMissingThenOtherOutboxesInTheRunAreRelayed() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt removed = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, removed, 'billing_feed');
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+
+        // The outbox with the missing definition is published first, so the run reaches it first.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(removed), newMessage(healthyDef) };
+        removeMessageDefinition(removed);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Both outboxes should be attempted in the one run');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with no definition should not be delivered');
+        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The outbox behind it should be delivered');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the healthy outbox should be sent');
+    }
+
+    @isTest
+    static void testWhenSubscriptionIsMissingThenOutboxDeadLettersAtMaxAttempts() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        // The outbox is created with the subscription's maximum of three attempts.
+        Test.startTest();
+        insert newMessage(msgDef);
+        setRelayAttempts(0, 2);
+        removeSubscription(subscription);
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(3, outbox.Relay_Attempts__c, 'The third attempt should be counted');
+        System.assertEquals(true, outbox.Dead_Lettered__c, 'The outbox should be dead-lettered at its maximum attempts');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+    }
+
+    @isTest
+    static void testWhenMessageDefinitionIsMissingThenOutboxDeadLettersAtMaxAttempts() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        // The outbox is created with the subscription's maximum of three attempts.
+        Test.startTest();
+        insert newMessage(msgDef);
+        setRelayAttempts(0, 2);
+        removeMessageDefinition(msgDef);
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(3, outbox.Relay_Attempts__c, 'The third attempt should be counted');
+        System.assertEquals(true, outbox.Dead_Lettered__c, 'The outbox should be dead-lettered at its maximum attempts');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+    }
+
+    /**
+     * An outbox is tied to its subscription by the subscription's name alone.
+     * The message it carries keeps its own type, and that type still has a definition.
+     * The subscription is no longer on that type, and its after-relay action is still given the attempt.
+     */
+    @isTest
+    static void testWhenSubscriptionIsMovedToAnotherDefinitionThenItsOutboxIsRelayed() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Definition__mdt otherDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+        subscription.After_Relay_Action__c = 'TB_TransactionOutboxTestUtils.RecordingAction';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        subscription.Message_Definition__r = otherDef;
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The outbox should be attempted once');
+        System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'The outbox should be delivered');
+        System.assertEquals(null, outbox.Last_Error_Message__c, 'No error should be recorded');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'The message should be sent once');
+
+        System.assertEquals(
+            1,
+            TB_TransactionOutboxTestUtils.actionCalls.size(),
+            'The moved subscription\'s action should run once'
+        );
+        List<TB_OutboxRelayContext> results = TB_TransactionOutboxTestUtils.actionCalls[0];
+        System.assertNotEquals(null, results, 'The action should be given the outbox\'s attempt, not null');
+        System.assertEquals(1, results.size(), 'The action should be given one attempt');
+        System.assertEquals(outbox.Id, results[0].outbox.Id, 'The action should be given this outbox\'s attempt');
+        System.assert(results[0].isComplete(), 'The attempt the action is given should be the delivered one');
+    }
+
+    static TB_Message_Subscription__mdt subscriptionToRestore;
+    static TB_Message_Definition__mdt definitionToRestore;
+    static Boolean configurationRestored = false;
+
+    /**
+     * Stands in for what happens between two runs: the removed configuration is put back under
+     * the same name, the retry wait passes, and a later run starts.
+     *
+     * A test cannot act between two runs itself, because every queued job runs inside Test.stopTest().
+     * An after-relay action is called once the first run's outcomes are stored, so a test puts this
+     * action on a healthy subscription that has an outbox in the first run.
+     */
+    public class RestoreConfigurationAction implements TB_IAfterRelayAction {
+        public void execute(TB_OutboxRelayContext[] ctx) {
+            // The second run may call the action again, and it must not start a third.
+            if (configurationRestored) {
+                return;
+            }
+            configurationRestored = true;
+
+            if (subscriptionToRestore != null) {
+                TB_OutboxMetadataProvider.subscriptions.add(subscriptionToRestore);
+            }
+            if (definitionToRestore != null) {
+                TB_OutboxMetadataProvider.msgDefinitions.add(definitionToRestore);
+            }
+
+            List<TB_Subscription_Outbox__c> waiting = [
+                SELECT Id
+                FROM TB_Subscription_Outbox__c
+                WHERE Completed_Timestamp__c = NULL AND Next_Attempt_Timestamp__c != NULL
+            ];
+            for (TB_Subscription_Outbox__c outbox : waiting) {
+                outbox.Next_Attempt_Timestamp__c = null;
+            }
+            update waiting;
+
+            System.enqueueJob(new TB_OutboxRelayQueuable());
+        }
+    }
+
+    @isTest
+    static void testWhenMissingSubscriptionIsRestoredThenOutboxIsDelivered() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt removed = addTestClientSubscription(app, msgDef, 'billing_feed');
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed')
+            .After_Relay_Action__c = 'TB_OutboxRelayTests.RestoreConfigurationAction';
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(healthyDef) };
+        removeSubscription(removed);
+        subscriptionToRestore = removed;
+        Test.stopTest();
+
+        System.assert(configurationRestored, 'The first run should finish and the subscription should be put back');
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals('billing_feed', outbox.Subscription__c);
+        System.assertEquals(
+            2,
+            outbox.Relay_Attempts__c,
+            'The first run should fail one attempt and the second should make another'
+        );
+        System.assertNotEquals(
+            null,
+            outbox.Completed_Timestamp__c,
+            'The outbox should be delivered once a subscription has its name again'
+        );
+        System.assertEquals(
+            2,
+            TB_TransactionOutboxTestUtils.sentMessages.size(),
+            'The healthy outbox is sent in the first run and the restored one in the second'
+        );
+    }
+
+    @isTest
+    static void testWhenMissingMessageDefinitionIsRestoredThenOutboxIsDelivered() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt removed = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        // With a backoff the first run leaves the outbox waiting, so only the restoring action starts the second run.
+        addTestClientSubscription(app, removed, 'billing_feed').Retry_BackOff__c = '30';
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed')
+            .After_Relay_Action__c = 'TB_OutboxRelayTests.RestoreConfigurationAction';
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(removed), newMessage(healthyDef) };
+        removeMessageDefinition(removed);
+        definitionToRestore = removed;
+        Test.stopTest();
+
+        System.assert(configurationRestored, 'The first run should finish and the definition should be put back');
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals('billing_feed', outbox.Subscription__c);
+        System.assertEquals(
+            2,
+            outbox.Relay_Attempts__c,
+            'The first run should fail one attempt and the second should make another'
+        );
+        System.assertNotEquals(
+            null,
+            outbox.Completed_Timestamp__c,
+            'The outbox should be delivered once a definition has the message type\'s name again'
+        );
+        System.assertEquals(
+            2,
+            TB_TransactionOutboxTestUtils.sentMessages.size(),
+            'The healthy outbox is sent in the first run and the restored one in the second'
+        );
+    }
+
+    /**
+     * The fallback retry wait is only used when a subscription is missing, but it is checked before
+     * anything is attempted. Here every outbox is healthy, and the run must still refuse to start.
+     */
+    @isTest
+    static void testWhenFallbackRetryWaitIsBlankThenRunFailsBeforeAnyAttempt() {
+        setFallbackRetryWait(null);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        String failure;
+        Test.startTest();
+        insert newMessage(msgDef);
+        try {
+            Test.stopTest();
+        } catch (TB_OutboxMetadataProvider.TB_InvalidConfigException e) {
+            failure = e.getMessage();
+        }
+
+        System.assertNotEquals(null, failure, 'The run should fail and say why');
+        System.assert(failure.contains('Fallback_Retry_Wait__c'), 'The error should name the setting: ' + failure);
+        System.assertEquals(new List<Integer>{ 0 }, attemptsInOrder(), 'Nothing should be attempted on an assumed wait');
+    }
+
+    @isTest
+    static void testWhenFallbackRetryWaitIsNegativeThenRunFailsBeforeAnyAttempt() {
+        setFallbackRetryWait(-1);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        String failure;
+        Test.startTest();
+        insert newMessage(msgDef);
+        try {
+            Test.stopTest();
+        } catch (TB_OutboxMetadataProvider.TB_InvalidConfigException e) {
+            failure = e.getMessage();
+        }
+
+        System.assertNotEquals(null, failure, 'The run should fail and say why');
+        System.assert(failure.contains('Fallback_Retry_Wait__c'), 'The error should name the setting: ' + failure);
+        System.assertEquals(new List<Integer>{ 0 }, attemptsInOrder(), 'Nothing should be attempted');
+    }
+
+    @isTest
+    static void testWhenFallbackRetryWaitIsAboveTheMaximumThenRunFailsBeforeAnyAttempt() {
+        setFallbackRetryWait(TB_OutboxMetadataProvider.MAX_FALLBACK_RETRY_WAIT + 1);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        String failure;
+        Test.startTest();
+        insert newMessage(msgDef);
+        try {
+            Test.stopTest();
+        } catch (TB_OutboxMetadataProvider.TB_InvalidConfigException e) {
+            failure = e.getMessage();
+        }
+
+        System.assertNotEquals(null, failure, 'The run should fail and say why');
+        System.assert(failure.contains('Fallback_Retry_Wait__c'), 'The error should name the setting: ' + failure);
+        System.assert(
+            failure.contains('from 0 to ' + TB_OutboxMetadataProvider.MAX_FALLBACK_RETRY_WAIT),
+            'The error should give the allowed range: ' + failure
+        );
+        System.assertEquals(new List<Integer>{ 0 }, attemptsInOrder(), 'Nothing should be attempted');
+    }
+
+    // The longest allowed wait still gives a next attempt time the outbox can be saved with.
+    @isTest
+    static void testWhenFallbackRetryWaitIsTheMaximumThenItIsUsed() {
+        setFallbackRetryWait(TB_OutboxMetadataProvider.MAX_FALLBACK_RETRY_WAIT);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        removeSubscription(subscription);
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted and saved');
+        assertNextAttemptIsInMinutes(
+            outbox,
+            TB_OutboxMetadataProvider.MAX_FALLBACK_RETRY_WAIT,
+            'The longest allowed fallback retry wait should be used.'
+        );
+    }
+
+    // A wait of zero asks for the next attempt at once, so the outbox is already due again when the run ends.
+    @isTest
+    static void testWhenFallbackRetryWaitIsZeroThenTheNextAttemptIsDueAtOnce() {
+        setFallbackRetryWait(0);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        removeSubscription(subscription);
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertNotEquals(null, outbox.Next_Attempt_Timestamp__c, 'A next attempt time should be set');
+        System.assert(
+            outbox.Next_Attempt_Timestamp__c <= Datetime.now(),
+            'The outbox should be due again already, but its next attempt is at ' + outbox.Next_Attempt_Timestamp__c
+        );
+    }
+
+    /**
+     * Nothing is sent for an outbox without configuration, so an isolated attempt earlier in the run
+     * does not keep it from being failed.
+     */
+    @isTest
+    static void testWhenSubscriptionIsMissingBehindAnIsolatedOutboxThenItStillFailsOneAttempt() {
+        setFallbackRetryWait(45);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt isolatedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, isolatedDef, 'isolated_feed').Isolate_Relay__c = true;
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        TB_Message_Subscription__mdt removed = addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        // The isolated outbox is published first, so it is the run's first attempt.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(isolatedDef), newMessage(msgDef) };
+        removeSubscription(removed);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Both outboxes should be attempted in the one run');
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The isolated outbox should be delivered');
+        System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The outbox with no subscription should not be delivered');
+        System.assert(
+            outboxes[1].Last_Error_Message__c.contains('billing_feed'),
+            'The error should name the missing subscription, but is: ' + outboxes[1].Last_Error_Message__c
+        );
+        assertNextAttemptIsInMinutes(outboxes[1], 45, 'A missing subscription should wait for the fallback retry wait.');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the isolated outbox should be sent');
+    }
+
+    // The failed attempt is one of the run's attempts, so the isolated outbox behind it is not first.
+    @isTest
+    static void testWhenSubscriptionIsMissingAheadOfAnIsolatedOutboxThenTheIsolatedOneIsPassedOver() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt removed = addTestClientSubscription(app, msgDef, 'billing_feed');
+        TB_Message_Definition__mdt isolatedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, isolatedDef, 'isolated_feed').Isolate_Relay__c = true;
+
+        // The outbox with the missing subscription is published first, so the run reaches it first.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(isolatedDef) };
+        removeSubscription(removed);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The missing subscription should fail one attempt and the isolated outbox should be passed over'
+        );
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with no subscription should not be delivered');
+        System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The isolated outbox should wait for a later run');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    /**
+     * The subscription is still there and is isolated, so its failed attempt ends what the run attempts,
+     * just as a sent isolated attempt would.
+     */
+    @isTest
+    static void testWhenIsolatedSubscriptionHasNoDefinitionThenItFailsAndLaterOutboxesArePassedOver() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt removed = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, removed, 'isolated_feed').Isolate_Relay__c = true;
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+
+        // The outbox with the missing definition is published first, so the run reaches it first.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(removed), newMessage(healthyDef) };
+        removeMessageDefinition(removed);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The isolated outbox should fail one attempt and the healthy one should be passed over'
+        );
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with no definition should not be delivered');
+        System.assert(
+            outboxes[0].Last_Error_Message__c.containsIgnoreCase('definition'),
+            'The error should say a message definition is missing, but is: ' + outboxes[0].Last_Error_Message__c
+        );
+        System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The healthy outbox should wait for a later run');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    @isTest
+    static void testWhenSubscriptionIsMissingThenLaterMessagesInItsGroupAreHeld() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt removed = addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1')
+        };
+        removeSubscription(removed);
+        Test.stopTest();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The first message should fail one attempt and the later one in its group should not be attempted'
+        );
+        System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The later message should not be delivered');
+        System.assertEquals(null, outboxes[1].Last_Error_Message__c, 'The later message should carry no error');
     }
 }

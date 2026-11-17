@@ -13,6 +13,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       executeStart = System.now();
   
       Integer batchSize = TB_OutboxMetadataProvider.getRelayBatchSize();
+      Integer fallbackRetryWait = TB_OutboxMetadataProvider.getFallbackRetryWait();
       GroupHolds holds = new GroupHolds();
       List<TB_Subscription_Outbox__c> outboxRecords = loadForAttempt(
         chooseAttemptable(batchSize, scanPageSize(batchSize), holds, executeStart),
@@ -24,32 +25,69 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         outboxRecords
       );
   
+      Map<String, TB_Message_Definition__mdt> definitionsByName = TB_OutboxMetadataProvider.getMessageDefintionMap();
+
       // transform DTO's
-      Map<Id, Object> allResolvedMessages = resolveMessages(msgsByType);
-  
-      Map<String, TB_Message_Subscription__mdt> subscriptionsMetadataMap = TB_OutboxMetadataProvider.getMessageSubscritionMap(
-        msgsByType.keySet()
+      Map<Id, Object> allResolvedMessages = resolveMessages(
+        msgsByType,
+        definitionsByName
       );
   
+      // An outbox finds its subscription by name, whichever message definition that subscription is on now.
+      Map<String, TB_Message_Subscription__mdt> subscriptionsByName = TB_OutboxMetadataProvider.getSubscriptionsByName(
+        subscriptionNamesOf(outboxRecords)
+      );
+  
+      // Actions are built for every subscription of the run's message types, and also for a
+      // subscription that has moved to another definition but still has outboxes in this run.
+      Map<String, TB_Message_Subscription__mdt> actionSubscriptions = TB_OutboxMetadataProvider.getMessageSubscritionMap(
+        msgsByType.keySet()
+      );
+      actionSubscriptions.putAll(subscriptionsByName);
+  
       OutboxFinalizer finalizer = attachFinalizer(
-        subscriptionsMetadataMap.values(),
+        actionSubscriptions.values(),
         holds,
         scanPageSize(batchSize)
       );
   
       Boolean isFirst = true;
+      // Once an isolated subscription has had an attempt, no outbox with configuration is attempted in this run.
+      Boolean isolatedAttempted = false;
       // Process Each Outbox
       for (TB_Subscription_Outbox__c item : outboxRecords) {
         if (holds.isHeld(item)) {
           continue;
         }
   
-        TB_Message_Subscription__mdt subDef = subscriptionsMetadataMap.get(
+        TB_Message_Subscription__mdt subDef = subscriptionsByName.get(
           item.Subscription__c
         );
+        TB_Message_Definition__mdt msgDef = definitionsByName.get(
+          item.Outbox_Message__r.Type__c
+        );
+  
+        // Nothing is sent for an outbox without configuration, so isolation does not keep it from
+        // being failed. Its attempt still counts as one of the run's attempts, so an isolated outbox
+        // behind it is not first, and an isolated subscription it belongs to still ends normal attempts.
+        if (subDef == null || msgDef == null) {
+          failWithoutConfiguration(
+            item,
+            subDef,
+            msgDef,
+            fallbackRetryWait,
+            finalizer
+          );
+          holds.hold(item);
+          isFirst = false;
+          if (subDef != null && subDef.Isolate_Relay__c) {
+            isolatedAttempted = true;
+          }
+          continue;
+        }
   
         // DO NOT process isolated outbox unless it's first
-        if (!isFirst && subDef.Isolate_Relay__c) {
+        if (isolatedAttempted || (!isFirst && subDef.Isolate_Relay__c)) {
           holds.hold(item);
           continue;
         }
@@ -62,9 +100,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           holds.hold(item);
         }
   
-        // do not process any additional records
         if (subDef.Isolate_Relay__c) {
-          break;
+          isolatedAttempted = true;
         }
       }
   
@@ -156,6 +193,75 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         finalizer.addResult(obCtx);
       }
       return delivered;
+    }
+  
+    private static Set<String> subscriptionNamesOf(
+      List<TB_Subscription_Outbox__c> outboxRecords
+    ) {
+      Set<String> names = new Set<String>();
+      for (TB_Subscription_Outbox__c item : outboxRecords) {
+        names.add(item.Subscription__c);
+      }
+      return names;
+    }
+  
+    /**
+     * Fails one attempt for an outbox whose subscription or message definition is missing.
+     * The attempt is counted and nothing is sent, so the outbox is retried like any failure and
+     * dead-letters at its own max attempts. A subscription or definition put back under the same
+     * name lets a later attempt deliver.
+     *
+     * While the subscription is there its own backoff decides the wait. Without it there is no
+     * backoff to read, so the fallback retry wait, in minutes, is used.
+     */
+    private void failWithoutConfiguration(
+      TB_Subscription_Outbox__c item,
+      TB_Message_Subscription__mdt subDef,
+      TB_Message_Definition__mdt msgDef,
+      Integer fallbackRetryWait,
+      OutboxFinalizer finalizer
+    ) {
+      TB_OutboxRelayContext obCtx = new TB_OutboxRelayContext(item, null, subDef);
+      obCtx.setAttempt();
+      item.Last_Error_Message__c = missingConfigurationReason(
+        item,
+        subDef,
+        msgDef
+      );
+      if (subDef == null) {
+        obCtx.setNextAttemptTimestamp(
+          System.now().addMinutes(fallbackRetryWait)
+        );
+      } else {
+        obCtx.setNextAttemptTimestamp(
+          TB_OutboxMetadataProvider.getSubscriptionNextAttemptTimeStamp(
+            subDef,
+            (Integer) item.Relay_Attempts__c
+          )
+        );
+      }
+      finalizer.addResult(obCtx);
+    }
+  
+    private static String missingConfigurationReason(
+      TB_Subscription_Outbox__c item,
+      TB_Message_Subscription__mdt subDef,
+      TB_Message_Definition__mdt msgDef
+    ) {
+      List<String> missing = new List<String>();
+      if (subDef == null) {
+        missing.add(
+          'no TB_Message_Subscription__mdt named ' + item.Subscription__c
+        );
+      }
+      if (msgDef == null) {
+        missing.add(
+          'no TB_Message_Definition__mdt named ' + item.Outbox_Message__r.Type__c
+        );
+      }
+      return 'Nothing was sent because there is ' +
+        String.join(missing, ' and ') +
+        '.';
     }
   
     // The most pages of due outboxes one search reads while looking for outboxes that can be attempted.
@@ -410,16 +516,16 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      * Bulk Resolve Messages.
      */
     private static Map<Id, Object> resolveMessages(
-      Map<String, TB_Outbox_Message__c[]> msgsByType
+      Map<String, TB_Outbox_Message__c[]> msgsByType,
+      Map<String, TB_Message_Definition__mdt> definitionsByLabel
     ) {
-      Map<String, TB_Message_Definition__mdt> definitionsByLabel = TB_OutboxMetadataProvider.getMessageDefintionMap();
-  
       //resolve Message DTO
       Map<Id, Object> allResolvedMessages = new Map<Id, Object>();
       for (String msgType : msgsByType.keySet()) {
         TB_Message_Definition__mdt def = definitionsByLabel.get(msgType);
         TB_Outbox_Message__c[] msgs = msgsByType.get(msgType);
-        if (def.Message_Resolver__c != null) {
+        // A type with no definition has no resolver. Its outboxes fail without being sent.
+        if (def != null && def.Message_Resolver__c != null) {
           try {
             TB_IOutboxMessageResolver resolver = TB_OutboxMetadataProvider.getMessageResolver(
               def

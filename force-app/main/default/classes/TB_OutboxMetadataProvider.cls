@@ -20,6 +20,31 @@ public class TB_OutboxMetadataProvider {
     @testVisible
     static TB_Message_Subscription__mdt[] subscriptions;
     public static Map<String, TB_Message_Subscription__mdt> getMessageSubscritionMap(Set<String> msgTypes) {
+        Map<String, TB_Message_Subscription__mdt> subscriptionsByLabel = new Map<String, TB_Message_Subscription__mdt>();
+        for (TB_Message_Subscription__mdt sub : loadSubscriptions()) {
+            if (msgTypes.contains(sub.Message_Definition__r.DeveloperName)) {
+                subscriptionsByLabel.put(sub.DeveloperName, sub);
+            }
+        }
+        return subscriptionsByLabel;
+    }
+
+    /**
+     * The subscriptions with these names, whatever message definition each is on now.
+     * An outbox is tied to its subscription by name alone, so a name with no subscription is
+     * left out and the caller treats that outbox as having no subscription.
+     */
+    public static Map<String, TB_Message_Subscription__mdt> getSubscriptionsByName(Set<String> names) {
+        Map<String, TB_Message_Subscription__mdt> subscriptionsByName = new Map<String, TB_Message_Subscription__mdt>();
+        for (TB_Message_Subscription__mdt sub : loadSubscriptions()) {
+            if (names.contains(sub.DeveloperName)) {
+                subscriptionsByName.put(sub.DeveloperName, sub);
+            }
+        }
+        return subscriptionsByName;
+    }
+
+    private static TB_Message_Subscription__mdt[] loadSubscriptions() {
         if (subscriptions == null) {
             subscriptions = [
                 SELECT
@@ -38,14 +63,7 @@ public class TB_OutboxMetadataProvider {
                 FROM TB_Message_Subscription__mdt
             ];
         }
-
-        Map<String, TB_Message_Subscription__mdt> subscriptionsByLabel = new Map<String, TB_Message_Subscription__mdt>();
-        for (TB_Message_Subscription__mdt sub : subscriptions) {
-            if (msgTypes.contains(sub.Message_Definition__r.DeveloperName)) {
-                subscriptionsByLabel.put(sub.DeveloperName, sub);
-            }
-        }
-        return subscriptionsByLabel;
+        return subscriptions;
     }
 
     @testVisible
@@ -62,20 +80,7 @@ public class TB_OutboxMetadataProvider {
      * so a missing record or value is an error and never a silently assumed number.
      */
     public static Integer getRelayBatchSize() {
-        if (frameworkSettings == null) {
-            frameworkSettings = [
-                SELECT DeveloperName, Relay_Batch_Size__c
-                FROM TB_Framework_Settings__mdt
-                WHERE DeveloperName = 'Default'
-            ];
-        }
-        if (frameworkSettings.isEmpty()) {
-            throw new TB_InvalidConfigException(
-                'No TB_Framework_Settings__mdt record named Default was found. The relay needs it for Relay_Batch_Size__c.'
-            );
-        }
-
-        Decimal batchSize = frameworkSettings[0].Relay_Batch_Size__c;
+        Decimal batchSize = defaultFrameworkSettings().Relay_Batch_Size__c;
         if (batchSize == null || batchSize < 1 || batchSize > MAX_RELAY_BATCH_SIZE) {
             throw new TB_InvalidConfigException(
                 'Relay_Batch_Size__c on the TB_Framework_Settings__mdt record named Default must be from 1 to ' +
@@ -86,6 +91,49 @@ public class TB_OutboxMetadataProvider {
             );
         }
         return batchSize.intValue();
+    }
+
+    // In minutes, one year. The next attempt time is the attempt time plus this wait, and it must stay
+    // a date the platform can store. A later date fails the outbox's save, so the outbox stays due and
+    // every run tries it again.
+    @testVisible
+    static final Integer MAX_FALLBACK_RETRY_WAIT = 525600;
+
+    /**
+     * Minutes an outbox waits before its next attempt when its subscription is missing,
+     * because there is then no retry backoff to read.
+     * It is read and checked at the start of every run, even a run with no such outbox,
+     * so a bad value stops the run before anything is attempted and never part-way through.
+     * Zero is accepted and means the next run may try again at once.
+     */
+    public static Integer getFallbackRetryWait() {
+        Decimal wait = defaultFrameworkSettings().Fallback_Retry_Wait__c;
+        if (wait == null || wait < 0 || wait > MAX_FALLBACK_RETRY_WAIT) {
+            throw new TB_InvalidConfigException(
+                'Fallback_Retry_Wait__c on the TB_Framework_Settings__mdt record named Default must be a number of minutes from 0 to ' +
+                    MAX_FALLBACK_RETRY_WAIT +
+                    '. It is ' +
+                    wait +
+                    '.'
+            );
+        }
+        return wait.intValue();
+    }
+
+    private static TB_Framework_Settings__mdt defaultFrameworkSettings() {
+        if (frameworkSettings == null) {
+            frameworkSettings = [
+                SELECT DeveloperName, Relay_Batch_Size__c, Fallback_Retry_Wait__c
+                FROM TB_Framework_Settings__mdt
+                WHERE DeveloperName = 'Default'
+            ];
+        }
+        if (frameworkSettings.isEmpty()) {
+            throw new TB_InvalidConfigException(
+                'No TB_Framework_Settings__mdt record named Default was found. The relay needs it for Relay_Batch_Size__c and Fallback_Retry_Wait__c.'
+            );
+        }
+        return frameworkSettings[0];
     }
 
     static Map<String, Map<String, Object>> configCache = new Map<String, Map<String, Object>>();

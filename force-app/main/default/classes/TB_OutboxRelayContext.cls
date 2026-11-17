@@ -7,13 +7,16 @@ public class TB_OutboxRelayContext {
      */
     public TB_Subscription_Outbox__c outbox;
 
-    /** 
-     * The subscription metadata
+    /**
+     * The subscription metadata.
+     * Null when no subscription has the outbox's subscription name. Such an attempt fails without
+     * sending and is never given to an after-relay action, because actions belong to subscriptions.
      */
     public TB_Message_Subscription__mdt subscription;
 
     /**
-     * The Configuration field from the subscription after being passed through `JSON.deserializeUntyped`
+     * The Configuration field from the subscription after being passed through `JSON.deserializeUntyped`.
+     * Null when the subscription is null.
      */
     public Map<String, Object> subscriptionConfig;
     
@@ -37,7 +40,9 @@ public class TB_OutboxRelayContext {
         this.outbox = outbox;
         this.resolvedMessage = resolvedMessage;
         this.subscription = subscription;
-        this.subscriptionConfig = TB_OutboxMetadataProvider.getSubscriptionConfig(subscription);
+        if (subscription != null) {
+            this.subscriptionConfig = TB_OutboxMetadataProvider.getSubscriptionConfig(subscription);
+        }
 
         // The log holds what was written during the most recent attempt only, so it starts empty.
         // The outbox is loaded without its stored log.

@@ -7,6 +7,10 @@
     <label>Default</label>
     <protected>false</protected>
     <values>
+        <field>Fallback_Retry_Wait__c</field>
+        <value xsi:type="xsd:double">720.0</value>
+    </values>
+    <values>
         <field>Relay_Batch_Size__c</field>
         <value xsi:type="xsd:double">100.0</value>
     </values>
