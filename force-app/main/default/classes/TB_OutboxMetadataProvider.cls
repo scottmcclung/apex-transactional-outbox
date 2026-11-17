@@ -93,6 +93,12 @@ public class TB_OutboxMetadataProvider {
         return batchSize.intValue();
     }
 
+    // In minutes, one year. The next attempt time is the attempt time plus this wait, and it must stay
+    // a date the platform can store. A later date fails the outbox's save, so the outbox stays due and
+    // every run tries it again.
+    @testVisible
+    static final Integer MAX_FALLBACK_RETRY_WAIT = 525600;
+
     /**
      * Minutes an outbox waits before its next attempt when its subscription is missing,
      * because there is then no retry backoff to read.
@@ -102,9 +108,11 @@ public class TB_OutboxMetadataProvider {
      */
     public static Integer getFallbackRetryWait() {
         Decimal wait = defaultFrameworkSettings().Fallback_Retry_Wait__c;
-        if (wait == null || wait < 0) {
+        if (wait == null || wait < 0 || wait > MAX_FALLBACK_RETRY_WAIT) {
             throw new TB_InvalidConfigException(
-                'Fallback_Retry_Wait__c on the TB_Framework_Settings__mdt record named Default must be a number of minutes, zero or more. It is ' +
+                'Fallback_Retry_Wait__c on the TB_Framework_Settings__mdt record named Default must be a number of minutes from 0 to ' +
+                    MAX_FALLBACK_RETRY_WAIT +
+                    '. It is ' +
                     wait +
                     '.'
             );

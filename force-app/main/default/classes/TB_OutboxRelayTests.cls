@@ -1732,6 +1732,53 @@ public class TB_OutboxRelayTests {
         System.assertEquals(new List<Integer>{ 0 }, attemptsInOrder(), 'Nothing should be attempted');
     }
 
+    @isTest
+    static void testWhenFallbackRetryWaitIsAboveTheMaximumThenRunFailsBeforeAnyAttempt() {
+        setFallbackRetryWait(TB_OutboxMetadataProvider.MAX_FALLBACK_RETRY_WAIT + 1);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+
+        String failure;
+        Test.startTest();
+        insert newMessage(msgDef);
+        try {
+            Test.stopTest();
+        } catch (TB_OutboxMetadataProvider.TB_InvalidConfigException e) {
+            failure = e.getMessage();
+        }
+
+        System.assertNotEquals(null, failure, 'The run should fail and say why');
+        System.assert(failure.contains('Fallback_Retry_Wait__c'), 'The error should name the setting: ' + failure);
+        System.assert(
+            failure.contains('from 0 to ' + TB_OutboxMetadataProvider.MAX_FALLBACK_RETRY_WAIT),
+            'The error should give the allowed range: ' + failure
+        );
+        System.assertEquals(new List<Integer>{ 0 }, attemptsInOrder(), 'Nothing should be attempted');
+    }
+
+    // The longest allowed wait still gives a next attempt time the outbox can be saved with.
+    @isTest
+    static void testWhenFallbackRetryWaitIsTheMaximumThenItIsUsed() {
+        setFallbackRetryWait(TB_OutboxMetadataProvider.MAX_FALLBACK_RETRY_WAIT);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        removeSubscription(subscription);
+        Test.stopTest();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted and saved');
+        assertNextAttemptIsInMinutes(
+            outbox,
+            TB_OutboxMetadataProvider.MAX_FALLBACK_RETRY_WAIT,
+            'The longest allowed fallback retry wait should be used.'
+        );
+    }
+
     // A wait of zero asks for the next attempt at once, so the outbox is already due again when the run ends.
     @isTest
     static void testWhenFallbackRetryWaitIsZeroThenTheNextAttemptIsDueAtOnce() {
