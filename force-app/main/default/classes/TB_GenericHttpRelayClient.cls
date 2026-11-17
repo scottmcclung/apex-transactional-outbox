@@ -16,11 +16,40 @@
   }
  */
 public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
-    // How long one request waits for the subscriber, in milliseconds. Set on every request so the
-    // wait is stated in one place rather than left to the platform.
+    // How long one request waits for the subscriber, in milliseconds. Set on every request and
+    // declared by costOfSend from this one value, so the declaration cannot drift from the wait.
     // It equals the platform's default of 10 seconds, the wait a request gets when it sets none.
-    // PLANNED: the wait comes from a required timeout setting on each subscription.
+    // PLANNED: the wait comes from a required timeout setting on each subscription, and costOfSend
+    // declares that subscription's value.
     private static final Integer CALLOUT_TIMEOUT_MS = 10000;
+
+    // The most CPU one send was measured to use in a scratch org was 19 ms, for a 64 KB body with a
+    // 128 KB response. CPU time varies between runs, so this allows more than twice that.
+    private static final Integer SEND_CPU_TIME_MS = 50;
+
+    // The longest body the message field holds, at about one byte of heap per character.
+    private static final Integer LONGEST_BODY_BYTES = 131072;
+
+    // Until the run saves, a send keeps the body twice in the attempt's log, and the response twice:
+    // once in the log or the error, and once in the relay result. The response cannot be known
+    // before sending, so it is assumed to be no longer than the longest body. The extra 4 KB covers
+    // the log's other lines. A longer response, or a resolved message longer than the message field,
+    // uses more than this.
+    private static final Integer SEND_HEAP_BYTES = 4 * LONGEST_BODY_BYTES + 4096;
+
+    public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
+        TB_SendCost cost = new TB_SendCost();
+        cost.callouts = 1;
+        cost.calloutTimeMs = CALLOUT_TIMEOUT_MS;
+        cost.queries = 0;
+        cost.queryRows = 0;
+        cost.dmlStatements = 0;
+        cost.dmlRows = 0;
+        cost.eventPublishes = 0;
+        cost.cpuTimeMs = SEND_CPU_TIME_MS;
+        cost.heapBytes = SEND_HEAP_BYTES;
+        return cost;
+    }
 
     public void send(TB_OutboxRelayContext ctx) {
         Object bodyObj = ctx.resolvedMessage != null ? ctx.resolvedMessage : ctx.outbox.Outbox_Message__r.Message__c;

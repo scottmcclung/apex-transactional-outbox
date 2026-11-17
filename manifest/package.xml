@@ -3,6 +3,7 @@
   <types>
     <members>TB_IAfterRelayAction</members>
     <members>TB_GenericHttpRelayClient</members>
+    <members>TB_GenericHttpRelayClientTests</members>
     <members>TB_IOutboxMessageResolver</members>
     <members>TB_IOutboxRelayClient</members>
     <members>TB_OutboxMessageTriggerHandler</members>
@@ -16,6 +17,7 @@
     <members>TB_RecordCleanupTests</members>
      <members>TB_ScheduleRelay</members>
     <members>TB_ScheduleRelayTest</members>
+    <members>TB_SendCost</members>
     <members>TB_TransactionOutboxTestUtils</members>
     <name>ApexClass</name>
   </types>
