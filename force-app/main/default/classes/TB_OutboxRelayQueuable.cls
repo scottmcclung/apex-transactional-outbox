@@ -68,8 +68,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           );
         } else if (turn == TurnOutcome.ATTEMPT) {
           Object resolvedEvt = allResolvedMessages.get(item.Outbox_Message__c);
-          Boolean delivered = attemptRelay(item, resolvedEvt, subDef, finalizer);
-          if (!delivered) {
+          AttemptOutcome outcome = attemptRelay(item, resolvedEvt, subDef, finalizer);
+          if (outcome == AttemptOutcome.FAILED) {
             turns.sendFailed(item);
           }
         }
@@ -148,13 +148,19 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       return finalizer;
     }
   
+    /** How one relay attempt ended. */
+    private enum AttemptOutcome {
+      DELIVERED,
+      FAILED
+    }
+
     /**
      * Makes one relay attempt for an outbox and hands the outcome to the finalizer.
-     * Returns whether the attempt finished without an exception.
+     * The attempt is delivered when it finished without an exception, and failed otherwise.
      * A subscription config that cannot be read fails the counted attempt before anything is sent,
      * and the outbox waits on its subscription's backoff like any failed attempt.
      */
-    private Boolean attemptRelay(
+    private AttemptOutcome attemptRelay(
       TB_Subscription_Outbox__c item,
       Object resolvedEvt,
       TB_Message_Subscription__mdt subDef,
@@ -166,7 +172,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         subDef
       );
   
-      Boolean delivered = false;
+      AttemptOutcome outcome = AttemptOutcome.FAILED;
       try {
         obCtx.setAttempt();
   
@@ -181,14 +187,14 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         obCtx.requireReadableConfig();
         client.send(obCtx);
         obCtx.setSuccess();
-        delivered = true;
+        outcome = AttemptOutcome.DELIVERED;
       } catch (Exception e) {
         obCtx.setError(e);
       } finally {
         //TODO: should this be added before? What happens if limit exception is thrown?
         finalizer.addResult(obCtx);
       }
-      return delivered;
+      return outcome;
     }
   
     private static Set<String> subscriptionNamesOf(
