@@ -16,6 +16,12 @@
   }
  */
 public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
+    // How long one request waits for the subscriber, in milliseconds. Set on every request so the
+    // wait is stated in one place rather than left to the platform.
+    // It equals the platform's default of 10 seconds, the wait a request gets when it sets none.
+    // PLANNED: the wait comes from a required timeout setting on each subscription.
+    private static final Integer CALLOUT_TIMEOUT_MS = 10000;
+
     public void send(TB_OutboxRelayContext ctx) {
         Object bodyObj = ctx.resolvedMessage != null ? ctx.resolvedMessage : ctx.outbox.Outbox_Message__r.Message__c;
         String bodyStr = bodyObj instanceof String ? String.valueof(bodyObj) : JSON.serialize(bodyObj);
@@ -42,6 +48,7 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
         req.setEndpoint(uri);
         req.setBody(bodyStr);
         req.setMethod(method);
+        req.setTimeout(CALLOUT_TIMEOUT_MS);
         Http http = new Http();
         HTTPResponse res = http.send(req);
         ctx.setResult(new GenericRelayResult(res));
