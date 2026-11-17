@@ -1,7 +1,11 @@
-global with sharing class TB_RecordCleanup implements Schedulable {
+// Runs without sharing because deleting a record needs ownership or Modify All, and messages are
+// owned by whoever published them. Cleanup applies fixed rules and is the only way a record leaves
+// the outbox, so it must not depend on the record access of the user who scheduled it.
+global without sharing class TB_RecordCleanup implements Schedulable {
     // Records, per delete. A run makes two deletes, so it changes at most 8,000 rows. That stays
     // under the 10,000 DML rows one transaction allows and leaves room for a caller's own DML.
     // A backlog larger than this is removed over later runs.
+    @TestVisible
     static final Integer MAX_RECORDS_PER_DELETE = 4000;
 
     global void execute(SchedulableContext sc) {
@@ -9,9 +13,11 @@ global with sharing class TB_RecordCleanup implements Schedulable {
     }
 
     public void cleanup() {
-        // Until retention and the expired state exist, TTL__c is the removal time. Only a delivered
-        // outbox is removed, so every outbox that is gone had a recorded outcome first. A blank TTL__c
-        // never matches the comparison, so an outbox with no TTL is kept.
+        // PLANNED: remove an outbox once it is settled (delivered, skipped or expired) and its
+        // retention period has ended. Today TTL__c is the removal time and only a delivered outbox
+        // is removed. An undelivered outbox is never removed, so every outbox that is gone had a
+        // recorded outcome first. A blank TTL__c never matches the comparison, so an outbox with
+        // no TTL is kept.
         Datetime now = System.now();
         List<TB_Subscription_Outbox__c> expiredRecords = [
             SELECT Id

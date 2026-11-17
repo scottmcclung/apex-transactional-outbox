@@ -195,9 +195,9 @@ One run removes at most 4,000 outboxes and 4,000 messages, so it stays inside th
 
 This TTL can either be set by the relay client, by using the subscription metadata `TTL Offset` & `Mark TTL Event` or by any other process.
 
-The `TB_OutboxCleanup` job can be scheduled in order to automatically remove records that have expired.  
+The `TB_OutboxCleanup` job can be scheduled in order to automatically remove delivered outboxes whose time to live has passed.
 
-`Outbox_Message__c` with no subscriptions will be removed by this job if the `Delete when outbox is empty` is checked.
+An `Outbox_Message__c` is removed by this job when it has no outboxes left and its message definition has `Delete when outbox is empty` checked.
 
 ### After Relay Actions
 

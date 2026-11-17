@@ -154,6 +154,38 @@ public class TB_RecordCleanupTests {
     }
 
     @isTest
+    static void testWhenDeadLetteredOutboxTtlHasPassedThenItIsKept() {
+        addDefinition(RETAINED_TYPE, false);
+        TB_Outbox_Message__c message = insertMessage(RETAINED_TYPE);
+        Datetime now = System.now();
+        TB_Subscription_Outbox__c outOfAttempts = buildOutbox(message.Id, null, now.addDays(-3));
+        outOfAttempts.Relay_Attempts__c = outOfAttempts.Max_Attempts__c;
+        TB_Subscription_Outbox__c manuallyDeadLettered = buildOutbox(message.Id, null, now.addDays(-3));
+        manuallyDeadLettered.Manual_Deadletter__c = true;
+        insert new List<TB_Subscription_Outbox__c>{ outOfAttempts, manuallyDeadLettered };
+
+        Integer deadLetteredBeforeRun = [
+            SELECT COUNT()
+            FROM TB_Subscription_Outbox__c
+            WHERE Id IN (:outOfAttempts.Id, :manuallyDeadLettered.Id) AND Dead_Lettered__c = TRUE
+        ];
+        System.assertEquals(2, deadLetteredBeforeRun, 'Both outboxes should be dead lettered before cleanup runs');
+
+        new TB_RecordCleanup().cleanup();
+
+        System.assertEquals(
+            true,
+            outboxExists(outOfAttempts.Id),
+            'An outbox dead lettered by running out of attempts should be kept after its TTL has passed'
+        );
+        System.assertEquals(
+            true,
+            outboxExists(manuallyDeadLettered.Id),
+            'An outbox dead lettered by hand should be kept after its TTL has passed'
+        );
+    }
+
+    @isTest
     static void testWhenMessageHasNoOutboxesAndDefinitionPurgesThenMessageIsRemoved() {
         addDefinition(PURGED_TYPE, true);
         TB_Outbox_Message__c message = insertMessage(PURGED_TYPE);
@@ -174,9 +206,8 @@ public class TB_RecordCleanupTests {
         Datetime now = System.now();
         insertOutbox(message.Id, now.addDays(-4), now.addDays(-3));
 
-        // Removal may lag the moment a message becomes empty by one run, so the second run
-        // is the latest point at which the message must be gone.
-        new TB_RecordCleanup().cleanup();
+        // Outboxes are removed before drained messages are looked for, so the run that removes
+        // the last outbox also removes the message.
         new TB_RecordCleanup().cleanup();
 
         System.assertEquals(
@@ -212,12 +243,17 @@ public class TB_RecordCleanupTests {
         addDefinition(PURGED_TYPE, true);
         TB_Outbox_Message__c message = insertMessage(PURGED_TYPE);
         Datetime now = System.now();
-        insertOutbox(message.Id, now.addDays(-4), now.addDays(-3));
+        TB_Subscription_Outbox__c delivered = insertOutbox(message.Id, now.addDays(-4), now.addDays(-3));
         TB_Subscription_Outbox__c undelivered = insertOutbox(message.Id, null, null);
 
         new TB_RecordCleanup().cleanup();
         new TB_RecordCleanup().cleanup();
 
+        System.assertEquals(
+            false,
+            outboxExists(delivered.Id),
+            'The delivered outbox whose TTL has passed should be removed'
+        );
         System.assertEquals(true, outboxExists(undelivered.Id), 'The undelivered outbox should be kept');
         System.assertEquals(
             true,
@@ -310,6 +346,71 @@ public class TB_RecordCleanupTests {
                 leftAfterFirstRun +
                 ', after later run: ' +
                 leftAfterLaterRun
+        );
+    }
+
+    @isTest
+    static void testWhenMoreMessagesAreDrainedThanTheCapThenOneRunRemovesTheCap() {
+        addDefinition(PURGED_TYPE, true);
+        TB_OutboxRelayQueuable.alreadyQueuedInContext = true;
+        Integer cap = TB_RecordCleanup.MAX_RECORDS_PER_DELETE;
+        Integer drainedCount = cap + 5;
+        List<TB_Outbox_Message__c> drained = new List<TB_Outbox_Message__c>();
+        for (Integer i = 0; i < drainedCount; i++) {
+            drained.add(new TB_Outbox_Message__c(Type__c = PURGED_TYPE, Message__c = 'Test Payload'));
+        }
+        insert drained;
+        drained = null;
+
+        Test.startTest();
+        new TB_RecordCleanup().cleanup();
+        Test.stopTest();
+
+        Integer left = [SELECT COUNT() FROM TB_Outbox_Message__c WHERE Type__c = :PURGED_TYPE];
+        System.assertEquals(
+            drainedCount - cap,
+            left,
+            'One run should remove ' + cap + ' drained messages and leave the rest for a later run'
+        );
+    }
+
+    @isTest
+    static void testWhenScheduledByUserWhoCannotDeleteTheRecordsThenCleanupStillRemovesThem() {
+        addDefinition(PURGED_TYPE, true);
+        TB_Outbox_Message__c message = insertMessage(PURGED_TYPE);
+        Datetime now = System.now();
+        TB_Subscription_Outbox__c outbox = insertOutbox(message.Id, now.addDays(-4), now.addDays(-3));
+
+        // A standard user has no Modify All on these objects and does not own records the test
+        // user inserted, so record sharing alone would not let this user delete them.
+        Profile standardProfile = [SELECT Id FROM Profile WHERE Name = 'Standard User' LIMIT 1];
+        String uniqueName = 'cleanup' + System.currentTimeMillis() + '@example.com';
+        User scheduler = new User(
+            Alias = 'cleanup',
+            Email = uniqueName,
+            Username = uniqueName,
+            LastName = 'Cleanup',
+            ProfileId = standardProfile.Id,
+            TimeZoneSidKey = 'America/Los_Angeles',
+            LocaleSidKey = 'en_US',
+            EmailEncodingKey = 'UTF-8',
+            LanguageLocaleKey = 'en_US'
+        );
+        insert scheduler;
+
+        System.runAs(scheduler) {
+            new TB_RecordCleanup().cleanup();
+        }
+
+        System.assertEquals(
+            false,
+            outboxExists(outbox.Id),
+            'Cleanup should remove a delivered outbox whose TTL has passed whoever scheduled it'
+        );
+        System.assertEquals(
+            false,
+            messageExists(message.Id),
+            'Cleanup should remove a drained message whoever scheduled it'
         );
     }
 }
