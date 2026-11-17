@@ -2163,7 +2163,8 @@ public class TB_OutboxRelayTests {
 
     /**
      * A relay client is handed the settings as a set of named values. JSON that parses but is a list,
-     * a text or a number cannot be handed over that way, so it is as unreadable as JSON that does not parse.
+     * a text, a number or the literal null cannot be handed over that way, so it is as unreadable as
+     * JSON that does not parse. The literal null differs from a field left empty, which means no settings.
      */
     @isTest
     static void testWhenSubscriptionSettingsAreNotAJsonObjectThenOneAttemptFailsForEach() {
@@ -2173,7 +2174,8 @@ public class TB_OutboxRelayTests {
         addTestClientSubscription(app, msgDef, 'feed1_list').Config__c = '["throwError"]';
         addTestClientSubscription(app, msgDef, 'feed2_text').Config__c = '"throwError"';
         addTestClientSubscription(app, msgDef, 'feed3_number').Config__c = '7';
-        addTestClientSubscription(app, msgDef, 'feed4_healthy');
+        addTestClientSubscription(app, msgDef, 'feed4_null').Config__c = 'null';
+        addTestClientSubscription(app, msgDef, 'feed5_healthy');
 
         Test.startTest();
         insert newMessage(msgDef);
@@ -2181,11 +2183,11 @@ public class TB_OutboxRelayTests {
 
         List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
         System.assertEquals(
-            new List<Integer>{ 1, 1, 1, 1 },
+            new List<Integer>{ 1, 1, 1, 1, 1 },
             attemptsInOrder(),
             'Every outbox should be attempted once in the one run'
         );
-        for (Integer i = 0; i < 3; i++) {
+        for (Integer i = 0; i < 4; i++) {
             System.assertEquals(
                 null,
                 outboxes[i].Completed_Timestamp__c,
@@ -2193,7 +2195,7 @@ public class TB_OutboxRelayTests {
             );
             assertErrorSaysSettingsCannotBeRead(outboxes[i]);
         }
-        System.assertNotEquals(null, outboxes[3].Completed_Timestamp__c, 'The healthy outbox should be delivered');
+        System.assertNotEquals(null, outboxes[4].Completed_Timestamp__c, 'The healthy outbox should be delivered');
         System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the healthy outbox should be sent');
     }
 
