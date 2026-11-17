@@ -5,7 +5,7 @@ public class TB_OutboxMetadataProvider {
     public static Map<String, TB_Message_Definition__mdt> getMessageDefintionMap() {
         if (msgDefinitions == null) {
             msgDefinitions = [
-                SELECT DeveloperName, QualifiedApiName, Message_Resolver__c
+                SELECT DeveloperName, QualifiedApiName, Message_Resolver__c, Delete_When_Outbox_Empty__c
                 FROM TB_Message_Definition__mdt
             ];
         }
