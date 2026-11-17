@@ -63,7 +63,11 @@ public class TB_OutboxRelayContext {
         }
     }
 
-    /** Throws when the subscription's Configuration field could not be read. */
+    /**
+     * The context is built before the attempt is counted and outside the attempt's error handling.
+     * Raising the failure from the constructor would leave the attempt uncounted and stop the run,
+     * so the attempt calls this once it has been counted.
+     */
     public void requireReadableConfig() {
         if (unreadableConfigReason != null) {
             throw new TB_OutboxMetadataProvider.TB_InvalidConfigException(unreadableConfigReason);
