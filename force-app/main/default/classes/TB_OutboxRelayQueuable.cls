@@ -629,8 +629,12 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
        * once, with that subscription's attempts. A subscription with no attempt gets no call, and
        * its action is not built.
        *
-       * An action that cannot be built or that throws is passed over and written to the debug log.
-       * The results are already saved, so it cannot change delivery or stop another action.
+       * An exception thrown while building or calling an action is caught and written to the debug
+       * log, and the other subscriptions' actions are still called.
+       *
+       * Actions run in the finalizer's transaction, after the results are saved and the next run is
+       * queued. A failure that cannot be caught, such as a governor limit, ends that transaction. The
+       * remaining actions are not called, and the saved results and the queued run are rolled back.
        */
       private void executeAfterActions() {
         Map<String, List<TB_OutboxRelayContext>> resultsBySubscription = new Map<String, List<TB_OutboxRelayContext>>();
@@ -665,9 +669,14 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
               'Could not build after relay action ' +
                 actionClassName +
                 ' for subscription ' +
-                subscriptionName
+                subscriptionName +
+                ': ' +
+                e.getTypeName() +
+                ': ' +
+                e.getMessage() +
+                '\n' +
+                e.getStackTraceString()
             );
-            System.debug(e);
             continue;
           }
 
@@ -678,9 +687,14 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
               'Exception executing after relay action ' +
                 actionClassName +
                 ' for subscription ' +
-                subscriptionName
+                subscriptionName +
+                ': ' +
+                e.getTypeName() +
+                ': ' +
+                e.getMessage() +
+                '\n' +
+                e.getStackTraceString()
             );
-            System.debug(e);
           }
         }
       }
