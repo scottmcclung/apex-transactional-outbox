@@ -61,18 +61,20 @@ Installing and activating are separate steps. The framework can be installed wit
 To install:
 
 1. git clone project
-2. `sf deploy metadata -x manifest/package.xml -o your_org_alias`
+2. `sf project deploy start -x manifest/package.xml -o your_org_alias`
 3. Add `TB_Admin` permission set to Users or Permission Set Groups
 
 Activating means scheduling two jobs: the relay sweep (`TB_ScheduleRelay`) and the cleanup job (`TB_RecordCleanup`). The team that activates the framework chooses how often each job runs. That team also checks that both jobs are in place. The framework has no setting for either interval and does not check for the jobs.
 
-Until the sweep is scheduled, a relay run starts only when a message is published, a run hands over to the next, or an operator asks. The sweep is what picks up an outbox whose retry wait has ended when nothing else starts a run. Its interval is the longest such an outbox waits.
+Until the sweep is scheduled, a relay run starts only when a message is published, a run hands over to the next, or someone runs `TB_OutboxRelayQueuable.enqueue(null)` as anonymous Apex. See "Dead-Lettered" below. The sweep is what picks up an outbox whose retry wait has ended when nothing else starts a run. The sweep interval is the longest that outbox waits.
 
 Until cleanup is scheduled, no record is removed.
 
 `post-install/schedule.apex` is an example that schedules both jobs to run every hour. Change it to suit your org, then run it:
 
 `sf apex run -f post-install/schedule.apex -o your_org_alias`
+
+If a job with either name already exists, the script fails and schedules nothing. Remove that job, or delete its line from the script, then run it again.
 
 A Salesforce scheduled job fires at most once an hour from one schedule expression. A schedule finer than hourly needs several jobs at different minutes. For example, a sweep every 15 minutes needs four jobs, at minutes 0, 15, 30 and 45.
 
