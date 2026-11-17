@@ -663,11 +663,11 @@ public class TB_OutboxRelayTests {
     }
 
     /**
-     * An action is built for every subscription of the message types in the run,
-     * so a subscription whose outbox was passed over still has its action called.
+     * An action is for the attempts its subscription had in the run. A subscription whose outbox was
+     * passed over had none, so there is nothing to give its action and it is not called.
      */
     @isTest
-    static void testAfterRelayActionIsCalledWithNullWhenSubscriptionHadNoAttempt() {
+    static void testWhenIsolatedOutboxIsPassedOverThenItsAfterRelayActionIsNotCalled() {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
         TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
         TB_Message_Subscription__mdt firstSub = TB_TransactionOutboxTestUtils.addSubscription(
@@ -676,6 +676,7 @@ public class TB_OutboxRelayTests {
             'subscription1'
         );
         firstSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
+        firstSub.After_Relay_Action__c = RECORDING_ACTION;
 
         // A second message type, so the isolated outbox has a later sequence number and is never first in the run.
         TB_Message_Definition__mdt isolatedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
@@ -686,7 +687,7 @@ public class TB_OutboxRelayTests {
         );
         isolatedSub.Relay_Client__c = 'TB_TransactionOutboxTestUtils.TestClient';
         isolatedSub.Isolate_Relay__c = true;
-        isolatedSub.After_Relay_Action__c = 'TB_TransactionOutboxTestUtils.RecordingAction';
+        isolatedSub.After_Relay_Action__c = RECORDING_ACTION;
 
         Test.startTest();
         insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(isolatedDef) };
@@ -694,8 +695,11 @@ public class TB_OutboxRelayTests {
 
         List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
         System.assertEquals(0, outboxes[1].Relay_Attempts__c, 'The isolated outbox should have been passed over');
-        System.assertEquals(1, TB_TransactionOutboxTestUtils.actionCalls.size(), 'The action should still be called');
-        System.assertEquals(null, TB_TransactionOutboxTestUtils.actionCalls[0], 'The action should be given null');
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'subscription1' => new Set<Id>{ outboxes[0].Id } },
+            actionCallsBySubscription(),
+            'Only the subscription that had an attempt should have its action called'
+        );
     }
 
     @isTest
@@ -729,6 +733,21 @@ public class TB_OutboxRelayTests {
             TB_TransactionOutboxTestUtils.actionCalls.size(),
             'The other subscription\'s action should still run'
         );
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(2, outboxes.size());
+        for (TB_Subscription_Outbox__c outbox : outboxes) {
+            System.assertNotEquals(
+                null,
+                outbox.Completed_Timestamp__c,
+                'A failed action should not change the delivery for ' + outbox.Subscription__c
+            );
+            System.assertEquals(
+                null,
+                outbox.Last_Error_Message__c,
+                'A failed action should leave no error on the outbox for ' + outbox.Subscription__c
+            );
+        }
     }
 
     static TB_Message_Subscription__mdt addTestClientSubscription(
@@ -2453,5 +2472,487 @@ public class TB_OutboxRelayTests {
         System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'The outbox should be delivered');
         System.assertEquals(null, outbox.Last_Error_Message__c, 'The outbox should carry no error');
         System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'The outbox should be sent');
+    }
+
+    static final String RECORDING_ACTION = 'TB_TransactionOutboxTestUtils.RecordingAction';
+
+    /**
+     * The outboxes each call to the recording action was given, by the subscription they belong to.
+     *
+     * An action exists to be told about attempts, so a call that carries none is a fault wherever it
+     * shows up. This fails on a call given null or an empty list, on a call that mixes subscriptions,
+     * and on a second call for one subscription. A test that spans two runs can use it as long as no
+     * subscription has attempts in both.
+     */
+    static Map<String, Set<Id>> actionCallsBySubscription() {
+        Integer callCount = TB_TransactionOutboxTestUtils.actionCalls.size();
+        Map<String, Set<Id>> outboxIdsBySubscription = new Map<String, Set<Id>>();
+        for (List<TB_OutboxRelayContext> call : TB_TransactionOutboxTestUtils.actionCalls) {
+            System.assertNotEquals(
+                null,
+                call,
+                'An action should never be given null, but one of the ' + callCount + ' action calls was'
+            );
+            System.assert(
+                !call.isEmpty(),
+                'An action should never be called with no attempts, but one of the ' + callCount + ' action calls was'
+            );
+
+            String subscriptionName = call[0].outbox.Subscription__c;
+            System.assert(
+                !outboxIdsBySubscription.containsKey(subscriptionName),
+                'The action for ' + subscriptionName + ' should be called once, with all of its attempts together'
+            );
+            Set<Id> outboxIds = new Set<Id>();
+            for (TB_OutboxRelayContext attempt : call) {
+                System.assertEquals(
+                    subscriptionName,
+                    attempt.outbox.Subscription__c,
+                    'An action should be given its own subscription\'s attempts and no other\'s'
+                );
+                outboxIds.add(attempt.outbox.Id);
+            }
+            outboxIdsBySubscription.put(subscriptionName, outboxIds);
+        }
+        return outboxIdsBySubscription;
+    }
+
+    /**
+     * The passed-over outbox gets its attempt in the second run, and that is the run its action belongs to.
+     */
+    @isTest
+    static void testWhenPassedOverOutboxIsDeliveredByTheNextRunThenItsAfterRelayActionIsCalledForThatRunOnly() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1').After_Relay_Action__c = RECORDING_ACTION;
+        // A second message type, so the isolated outbox has a later sequence number and is never first in the run.
+        TB_Message_Definition__mdt isolatedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        TB_Message_Subscription__mdt isolatedSub = addTestClientSubscription(app, isolatedDef, 'subscription2');
+        isolatedSub.Isolate_Relay__c = true;
+        isolatedSub.After_Relay_Action__c = RECORDING_ACTION;
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(isolatedDef) };
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(2, relayJobCount(), 'A second run should be queued for the isolated outbox');
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Each outbox should be attempted once');
+        System.assertEquals(
+            new Map<String, Set<Id>>{
+                'subscription1' => new Set<Id>{ outboxes[0].Id },
+                'subscription2' => new Set<Id>{ outboxes[1].Id }
+            },
+            actionCallsBySubscription(),
+            'Each action should be called once, by the run that attempted its subscription\'s outbox'
+        );
+        System.assertEquals(
+            outboxes[0].Id,
+            TB_TransactionOutboxTestUtils.actionCalls[0][0].outbox.Id,
+            'The first run should call only the action of the subscription it attempted'
+        );
+    }
+
+    @isTest
+    static void testWhenOutboxIsHeldByItsGroupThenItsAfterRelayActionIsNotCalled() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt failingDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt failingSub = addTestClientSubscription(app, failingDef, 'subscription1');
+        failingSub.Config__c = '{"throwError":true}';
+        failingSub.After_Relay_Action__c = RECORDING_ACTION;
+        TB_Message_Definition__mdt heldDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, heldDef, 'subscription2').After_Relay_Action__c = RECORDING_ACTION;
+
+        // The first message fails in the run, so the one after it in the group is held and not attempted.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(failingDef, 'group1'),
+            newGroupedMessage(heldDef, 'group1')
+        };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The first outbox should fail one attempt and the held one should not be attempted'
+        );
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'subscription1' => new Set<Id>{ outboxes[0].Id } },
+            actionCallsBySubscription(),
+            'Only the subscription that had an attempt should have its action called'
+        );
+    }
+
+    /**
+     * Two subscriptions take the same message type. One of them has nothing due in this run, which is
+     * the ordinary state of a subscription whose outbox is waiting or was settled by an earlier run.
+     */
+    @isTest
+    static void testWhenSubscriptionHasNoDueOutboxThenItsAfterRelayActionIsNotCalled() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1').After_Relay_Action__c = RECORDING_ACTION;
+        addTestClientSubscription(app, msgDef, 'subscription2').After_Relay_Action__c = RECORDING_ACTION;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        makeOutboxWaitOnBackoff(1);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals('subscription2', outboxes[1].Subscription__c);
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The outbox waiting on its backoff should not be attempted'
+        );
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'subscription1' => new Set<Id>{ outboxes[0].Id } },
+            actionCallsBySubscription(),
+            'Only the subscription that had an attempt should have its action called'
+        );
+    }
+
+    @isTest
+    static void testWhenSubscriptionHasNoOutboxThenItsAfterRelayActionIsNotCalled() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1').After_Relay_Action__c = RECORDING_ACTION;
+        // A disabled subscription gets no outbox when a message is published.
+        TB_Message_Subscription__mdt disabledSub = addTestClientSubscription(app, msgDef, 'subscription2');
+        disabledSub.Enabled__c = false;
+        disabledSub.After_Relay_Action__c = RECORDING_ACTION;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(1, outboxes.size(), 'Only the enabled subscription should have an outbox');
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox should be delivered');
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'subscription1' => new Set<Id>{ outboxes[0].Id } },
+            actionCallsBySubscription(),
+            'Only the subscription that had an attempt should have its action called'
+        );
+    }
+
+    static final String FAILING_PAYLOAD = 'Payload the subscriber refuses';
+
+    // Lets one subscription have a delivered attempt and a failed attempt in the same run.
+    public class RefusesOnePayloadClient implements TB_IOutboxRelayClient {
+        public void send(TB_OutboxRelayContext ctx) {
+            if (ctx.outbox.Outbox_Message__r.Message__c == FAILING_PAYLOAD) {
+                throw new TB_TransactionOutboxTestUtils.TestException('Test Error');
+            }
+        }
+    }
+
+    @isTest
+    static void testAfterRelayActionIsGivenEveryAttemptItsSubscriptionHadInTheRun() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt mixedSub = TB_TransactionOutboxTestUtils.addSubscription(app, msgDef, 'billing_feed');
+        mixedSub.Relay_Client__c = 'TB_OutboxRelayTests.RefusesOnePayloadClient';
+        mixedSub.After_Relay_Action__c = RECORDING_ACTION;
+        addTestClientSubscription(app, msgDef, 'shipping_feed').After_Relay_Action__c = RECORDING_ACTION;
+
+        TB_Outbox_Message__c refused = newMessage(msgDef);
+        refused.Message__c = FAILING_PAYLOAD;
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), refused };
+        stopTestExpectingNoFailedJob();
+
+        // Each message has one outbox per subscription, so the order is billing, shipping, billing, shipping.
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1, 1, 1 }, attemptsInOrder(), 'Every outbox should be attempted once');
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The first billing outbox should be delivered');
+        System.assertEquals(null, outboxes[2].Completed_Timestamp__c, 'The refused billing outbox should not be delivered');
+
+        System.assertEquals(
+            new Map<String, Set<Id>>{
+                'billing_feed' => new Set<Id>{ outboxes[0].Id, outboxes[2].Id },
+                'shipping_feed' => new Set<Id>{ outboxes[1].Id, outboxes[3].Id }
+            },
+            actionCallsBySubscription(),
+            'Each action should be called once with its own subscription\'s attempts, delivered and failed alike'
+        );
+
+        for (List<TB_OutboxRelayContext> call : TB_TransactionOutboxTestUtils.actionCalls) {
+            for (TB_OutboxRelayContext attempt : call) {
+                System.assertEquals(
+                    attempt.outbox.Id != outboxes[2].Id,
+                    attempt.isComplete(),
+                    'Only the refused attempt should reach its action as not delivered'
+                );
+            }
+        }
+        System.assertEquals(
+            new List<Integer>{ 2, 2 },
+            TB_TransactionOutboxTestUtils.actionSavedCounts,
+            'The attempts should be stored before the actions run'
+        );
+    }
+
+    // A class that exists and can be built, but is not an after-relay action.
+    public class NotAnAfterRelayAction {
+    }
+
+    public class UnbuildableAction implements TB_IAfterRelayAction {
+        public UnbuildableAction() {
+            throw new TB_TransactionOutboxTestUtils.TestException('Constructor Error');
+        }
+
+        public void execute(TB_OutboxRelayContext[] ctx) {
+        }
+    }
+
+    /**
+     * An action that cannot be built is an action that failed, and a failed action changes nothing
+     * about delivery. So the subscription naming it is relayed like any other, the rest of the run
+     * goes on, the outcomes are stored, and the other subscriptions' actions still run.
+     */
+    static void assertRunIsUnaffectedByAfterRelayAction(String actionClassName) {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, faultyDef, 'billing_feed').After_Relay_Action__c = actionClassName;
+        TB_Message_Definition__mdt recordedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, recordedDef, 'shipping_feed').After_Relay_Action__c = RECORDING_ACTION;
+        TB_Message_Definition__mdt plainDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message3');
+        addTestClientSubscription(app, plainDef, 'audit_feed');
+
+        // The outbox whose subscription names the faulty action is published first, so the run reaches it first.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(faultyDef), newMessage(recordedDef), newMessage(plainDef) };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(3, outboxes.size());
+        System.assertEquals(
+            new List<Integer>{ 1, 1, 1 },
+            attemptsInOrder(),
+            'Every outbox should be attempted in the one run and the attempts stored'
+        );
+        for (TB_Subscription_Outbox__c outbox : outboxes) {
+            System.assertNotEquals(
+                null,
+                outbox.Completed_Timestamp__c,
+                'The outbox for ' + outbox.Subscription__c + ' should be delivered'
+            );
+            System.assertEquals(
+                null,
+                outbox.Last_Error_Message__c,
+                'A faulty action is not a failed delivery, so no outbox should carry an error, but ' +
+                    outbox.Subscription__c +
+                    ' does'
+            );
+        }
+        System.assertEquals(3, TB_TransactionOutboxTestUtils.sentMessages.size(), 'All three messages should be sent');
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'shipping_feed' => new Set<Id>{ outboxes[1].Id } },
+            actionCallsBySubscription(),
+            'The other subscription\'s action should still be called with its attempt'
+        );
+        System.assertEquals(
+            new List<Integer>{ 1 },
+            TB_TransactionOutboxTestUtils.actionSavedCounts,
+            'The attempt should be stored before the other subscription\'s action runs'
+        );
+    }
+
+    @isTest
+    static void testWhenAfterRelayActionClassDoesNotExistThenTheRunIsNotStopped() {
+        assertRunIsUnaffectedByAfterRelayAction('TB_OutboxRelayTests.NoSuchAction');
+    }
+
+    @isTest
+    static void testWhenAfterRelayActionClassIsNotAnActionThenTheRunIsNotStopped() {
+        assertRunIsUnaffectedByAfterRelayAction('TB_OutboxRelayTests.NotAnAfterRelayAction');
+    }
+
+    @isTest
+    static void testWhenAfterRelayActionConstructorThrowsThenTheRunIsNotStopped() {
+        assertRunIsUnaffectedByAfterRelayAction('TB_OutboxRelayTests.UnbuildableAction');
+    }
+
+    /**
+     * A subscription keeps its faulty action name from one run to the next, so every run meets it.
+     * The batch size leaves the second outbox for a second run.
+     */
+    @isTest
+    static void testWhenAfterRelayActionClassDoesNotExistThenLaterRunsStillRelay() {
+        setRelayBatchSize(1);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'billing_feed')
+            .After_Relay_Action__c = 'TB_OutboxRelayTests.NoSuchAction';
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(msgDef) };
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        stopTestExpectingNoFailedJob();
+
+        System.assertEquals(2, relayJobCount(), 'The first run should queue a second for the outbox it left');
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Each run should attempt one outbox');
+        for (TB_Subscription_Outbox__c outbox : outboxesInOrder()) {
+            System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'Both outboxes should be delivered across the two runs');
+        }
+    }
+
+    /**
+     * The faulty name is on a subscription that has nothing in the run at all. It takes the same
+     * message type as the outbox being relayed, which is all it has to do with this run.
+     */
+    @isTest
+    static void testWhenSubscriptionWithNoAttemptNamesAnActionClassThatDoesNotExistThenTheRunIsNotStopped() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+        // A disabled subscription gets no outbox when a message is published.
+        TB_Message_Subscription__mdt disabledSub = addTestClientSubscription(app, msgDef, 'subscription2');
+        disabledSub.Enabled__c = false;
+        disabledSub.After_Relay_Action__c = 'TB_OutboxRelayTests.NoSuchAction';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(1, outboxes.size(), 'Only the enabled subscription should have an outbox');
+        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'The outbox should be attempted');
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox should be delivered');
+    }
+
+    /**
+     * The subscription is still there when its message definition is missing, so the failed attempt
+     * is one of that subscription's attempts and its action is told about it.
+     */
+    @isTest
+    static void testWhenMessageDefinitionIsMissingThenTheSubscriptionsAfterRelayActionIsGivenTheFailedAttempt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'billing_feed').After_Relay_Action__c = RECORDING_ACTION;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        removeMessageDefinition(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'billing_feed' => new Set<Id>{ outbox.Id } },
+            actionCallsBySubscription(),
+            'The action should be called once with the attempt that failed for want of a definition'
+        );
+        TB_OutboxRelayContext attempt = TB_TransactionOutboxTestUtils.actionCalls[0][0];
+        System.assert(!attempt.isComplete(), 'The attempt the action is given should be the failed one');
+        System.assert(
+            attempt.outbox.Last_Error_Message__c.contains('test.message1'),
+            'The attempt should carry the reason it failed, but has: ' + attempt.outbox.Last_Error_Message__c
+        );
+        System.assertEquals(
+            new List<Integer>{ 1 },
+            TB_TransactionOutboxTestUtils.actionSavedCounts,
+            'The failed attempt should be stored before the action runs'
+        );
+    }
+
+    /**
+     * An outbox is tied to its subscription by name. After a rename no subscription has that name,
+     * so the failed attempt belongs to no subscription. The renamed subscription takes the same
+     * message type, but it had no attempt of its own and its action is not called.
+     */
+    @isTest
+    static void testWhenSubscriptionIsRenamedThenItsAfterRelayActionIsNotCalledForTheOrphanedOutbox() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt renamed = addTestClientSubscription(app, msgDef, 'billing_feed');
+        renamed.After_Relay_Action__c = RECORDING_ACTION;
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed').After_Relay_Action__c = RECORDING_ACTION;
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(msgDef), newMessage(healthyDef) };
+        renamed.DeveloperName = 'billing_feed_v2';
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals('billing_feed', outboxes[0].Subscription__c);
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Both outboxes should be attempted in the one run');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox under the old name should not be delivered');
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'shipping_feed' => new Set<Id>{ outboxes[1].Id } },
+            actionCallsBySubscription(),
+            'Only the subscription that had an attempt of its own should have its action called'
+        );
+    }
+
+    /**
+     * Settings that cannot be read fail an ordinary attempt for a subscription that exists,
+     * so its action is told about that attempt like any other failure.
+     */
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedThenItsAfterRelayActionIsGivenTheFailedAttempt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, msgDef, 'billing_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        faulty.After_Relay_Action__c = RECORDING_ACTION;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'billing_feed' => new Set<Id>{ outbox.Id } },
+            actionCallsBySubscription(),
+            'The action should be called once with the attempt that failed on the settings'
+        );
+        TB_OutboxRelayContext attempt = TB_TransactionOutboxTestUtils.actionCalls[0][0];
+        System.assert(!attempt.isComplete(), 'The attempt the action is given should be the failed one');
+        System.assert(
+            attempt.outbox.Last_Error_Message__c.contains('Config__c'),
+            'The attempt should carry the reason it failed, but has: ' + attempt.outbox.Last_Error_Message__c
+        );
+        System.assertEquals(
+            new List<Integer>{ 1 },
+            TB_TransactionOutboxTestUtils.actionSavedCounts,
+            'The failed attempt should be stored before the action runs'
+        );
+    }
+
+    @isTest
+    static void testWhenSubscriptionNamesNoAfterRelayActionThenItIsRelayedAndNoActionRunsForIt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'billing_feed').After_Relay_Action__c = null;
+        addTestClientSubscription(app, msgDef, 'shipping_feed').After_Relay_Action__c = RECORDING_ACTION;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Both outboxes should be attempted');
+        for (TB_Subscription_Outbox__c outbox : outboxes) {
+            System.assertNotEquals(
+                null,
+                outbox.Completed_Timestamp__c,
+                'The outbox for ' + outbox.Subscription__c + ' should be delivered'
+            );
+        }
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'shipping_feed' => new Set<Id>{ outboxes[1].Id } },
+            actionCallsBySubscription(),
+            'Only the subscription that names an action should have one called'
+        );
     }
 }
