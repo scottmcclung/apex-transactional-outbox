@@ -5,6 +5,9 @@ public class TB_GenericHttpRelayClientTests {
     // kept in step with the client by hand.
     static final Integer WAIT_THE_CLIENT_USES_MS = 10000;
 
+    // The longest body the message field holds. The client assumes no response is longer.
+    static final Integer LONGEST_BODY_LENGTH = 131072;
+
     static TB_Message_Subscription__mdt addHttpSubscription(String name) {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
         TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
@@ -18,7 +21,7 @@ public class TB_GenericHttpRelayClientTests {
         public HttpResponse respond(HttpRequest req) {
             HttpResponse res = new HttpResponse();
             res.setStatusCode(200);
-            res.setBody('accepted');
+            res.setBody('r'.repeat(LONGEST_BODY_LENGTH));
             return res;
         }
     }
@@ -67,12 +70,12 @@ public class TB_GenericHttpRelayClientTests {
         TB_SendCost cost = client.costOfSend(subscription);
         Test.stopTest();
 
-        // A run adds these to what it has already used, so a missing or negative value would make
-        // the run think it has more room than it has.
+        // A run adds these to what it has already used, so a missing, zero or negative value would
+        // make the run think it has more room than it has.
         System.assertNotEquals(null, cost.cpuTimeMs, 'The cost should state processing time');
-        System.assert(cost.cpuTimeMs >= 0, 'Processing time cannot be negative');
+        System.assert(cost.cpuTimeMs > 0, 'Every send uses some processing time');
         System.assertNotEquals(null, cost.heapBytes, 'The cost should state memory');
-        System.assert(cost.heapBytes >= 0, 'Memory cannot be negative');
+        System.assert(cost.heapBytes > 0, 'Every send uses some memory');
     }
 
     @isTest
@@ -81,10 +84,11 @@ public class TB_GenericHttpRelayClientTests {
         TB_GenericHttpRelayClient client = new TB_GenericHttpRelayClient();
         TB_SendCost cost = client.costOfSend(subscription);
         // Given a resolved message so the client has a body without the outbox being saved first.
-        // A save here would count against the limits being measured.
+        // A save here would count against the limits being measured. The body and the response are
+        // the longest the client allows for, which is where it uses the most heap.
         TB_OutboxRelayContext ctx = new TB_OutboxRelayContext(
             new TB_Subscription_Outbox__c(),
-            'Test Payload',
+            'b'.repeat(LONGEST_BODY_LENGTH),
             subscription
         );
         Test.setMock(HttpCalloutMock.class, new AcceptingSubscriber());
@@ -96,7 +100,10 @@ public class TB_GenericHttpRelayClientTests {
         Integer dmlStatementsBefore = Limits.getDmlStatements();
         Integer dmlRowsBefore = Limits.getDmlRows();
         Integer eventPublishesBefore = Limits.getPublishImmediateDML();
+        Integer heapBefore = Limits.getHeapSize();
         client.send(ctx);
+        // Read first, so the other readings below do not count towards it.
+        Integer heapAdded = Limits.getHeapSize() - heapBefore;
         Integer calloutsUsed = Limits.getCallouts() - calloutsBefore;
         Integer queriesUsed = Limits.getQueries() - queriesBefore;
         Integer queryRowsUsed = Limits.getQueryRows() - queryRowsBefore;
@@ -112,5 +119,10 @@ public class TB_GenericHttpRelayClientTests {
         System.assert(dmlStatementsUsed <= cost.dmlStatements, 'The send made more writes than declared');
         System.assert(dmlRowsUsed <= cost.dmlRows, 'The send wrote more rows than declared');
         System.assert(eventPublishesUsed <= cost.eventPublishes, 'The send published more events than declared');
+        // Only what the send still holds can be read here, not its highest point during the send.
+        System.assert(
+            heapAdded <= cost.heapBytes,
+            'The send held more heap than declared: ' + heapAdded + ' bytes against ' + cost.heapBytes
+        );
     }
 }

@@ -23,19 +23,34 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
     // declares that subscription's value.
     private static final Integer CALLOUT_TIMEOUT_MS = 10000;
 
-    // The most CPU one send was measured to use in a scratch org was 19 ms, for a 64 KB body with a
-    // 128 KB response. CPU time varies between runs, so this allows more than twice that.
-    private static final Integer SEND_CPU_TIME_MS = 50;
+    // Measured in a scratch org with Limits.getCpuTime() around six sends of a 131,072 character
+    // String body to an echo service, which answered each with HTTP 500 and a 21 character body.
+    // The first send in the transaction used 63 ms and the other five used 3 to 6 ms. Sends against
+    // a callout mock returning a 131,072 character body used 5 or 6 ms in 20 samples, half with a
+    // String body and half with a one-key Map. This allows half again over the highest seen. A
+    // resolved message that is not a String is serialized to JSON first, and a large or deeply
+    // nested one can use more than this.
+    private static final Integer SEND_CPU_TIME_MS = 100;
 
-    // The longest body the message field holds, at about one byte of heap per character.
+    // The longest body the message field holds. A String takes one byte of heap per character
+    // plus a few bytes, as measured with Limits.getHeapSize().
     private static final Integer LONGEST_BODY_BYTES = 131072;
 
-    // Until the run saves, a send keeps the body twice in the attempt's log, and the response twice:
-    // once in the log or the error, and once in the relay result. The response cannot be known
-    // before sending, so it is assumed to be no longer than the longest body. The extra 4 KB covers
-    // the log's other lines. A longer response, or a resolved message longer than the message field,
-    // uses more than this.
-    private static final Integer SEND_HEAP_BYTES = 4 * LONGEST_BODY_BYTES + 4096;
+    // Counted in copies of the longest body, for a body and a response each no longer than it. The
+    // response cannot be known before sending, so that is an assumption. A longer body or response
+    // uses more, in proportion to its length.
+    //
+    // Each log line rebuilds the whole log, so the old and new log are held at once. The worst point
+    // is the last log line on success. Before it the send holds the log with the body twice (2), the
+    // response and the relay result's copy of its body (2), and the JSON body when the resolved
+    // message is not a String (1). That line builds the response text through up to five strings (5)
+    // and a new log holding the body twice and the response once (3). Limits.getHeapSize() cannot be
+    // read inside one statement, so all five are counted as held at once. That is 13 copies. The
+    // extra 4 KB covers the log's other lines.
+    //
+    // What a send still holds when it returns is lower. In a test against a mock it was 4 copies on
+    // success, and 5 on failure once the run stored the error message.
+    private static final Integer SEND_HEAP_BYTES = 13 * LONGEST_BODY_BYTES + 4096;
 
     public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
         TB_SendCost cost = new TB_SendCost();
