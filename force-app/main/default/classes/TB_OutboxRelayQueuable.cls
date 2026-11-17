@@ -336,40 +336,39 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
             ' stated no cost for a send, so the run could not tell whether it had room for one. Nothing was sent.'
         );
       }
-      Map<String, Integer> amounts = amountsByField(cost);
-      for (String field : amounts.keySet()) {
-        Integer amount = amounts.get(field);
-        if (amount == null || amount < 0) {
-          throw new SendCostException(
-            'Relay client ' +
-              clientName +
-              ' stated ' +
-              (amount == null ? 'no value' : 'a negative value') +
-              ' for ' +
-              field +
-              ' in the cost of a send. Every field must be 0 or more. Nothing was sent.'
-          );
-        }
-      }
+      // The fields are checked one by one, without building a map, because this runs before every
+      // attempt.
+      requireUsableAmount(clientName, 'callouts', cost.callouts);
+      requireUsableAmount(clientName, 'calloutTimeMs', cost.calloutTimeMs);
+      requireUsableAmount(clientName, 'queries', cost.queries);
+      requireUsableAmount(clientName, 'queryRows', cost.queryRows);
+      requireUsableAmount(clientName, 'dmlStatements', cost.dmlStatements);
+      requireUsableAmount(clientName, 'dmlRows', cost.dmlRows);
+      requireUsableAmount(clientName, 'eventPublishes', cost.eventPublishes);
+      requireUsableAmount(clientName, 'cpuTimeMs', cost.cpuTimeMs);
+      requireUsableAmount(clientName, 'heapBytes', cost.heapBytes);
       return cost;
     }
 
-    private class SendCostException extends Exception {
+    private static void requireUsableAmount(
+      String clientName,
+      String field,
+      Integer amount
+    ) {
+      if (amount == null || amount < 0) {
+        throw new SendCostException(
+          'Relay client ' +
+            clientName +
+            ' stated ' +
+            (amount == null ? 'no value' : 'a negative value') +
+            ' for ' +
+            field +
+            ' in the cost of a send. Every field must be 0 or more. Nothing was sent.'
+        );
+      }
     }
 
-    /** The nine amounts in a cost, each under the name of its TB_SendCost field. */
-    private static Map<String, Integer> amountsByField(TB_SendCost cost) {
-      return new Map<String, Integer>{
-        'callouts' => cost.callouts,
-        'calloutTimeMs' => cost.calloutTimeMs,
-        'queries' => cost.queries,
-        'queryRows' => cost.queryRows,
-        'dmlStatements' => cost.dmlStatements,
-        'dmlRows' => cost.dmlRows,
-        'eventPublishes' => cost.eventPublishes,
-        'cpuTimeMs' => cost.cpuTimeMs,
-        'heapBytes' => cost.heapBytes
-      };
+    private class SendCostException extends Exception {
     }
 
     /**
@@ -379,14 +378,15 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      */
     @TestVisible
     static Boolean hasBudgetFor(TB_SendCost cost, TB_SendCost left) {
-      Map<String, Integer> needed = amountsByField(cost);
-      Map<String, Integer> available = amountsByField(left);
-      for (String field : needed.keySet()) {
-        if (needed.get(field) > available.get(field)) {
-          return false;
-        }
-      }
-      return true;
+      return cost.callouts <= left.callouts &&
+        cost.calloutTimeMs <= left.calloutTimeMs &&
+        cost.queries <= left.queries &&
+        cost.queryRows <= left.queryRows &&
+        cost.dmlStatements <= left.dmlStatements &&
+        cost.dmlRows <= left.dmlRows &&
+        cost.eventPublishes <= left.eventPublishes &&
+        cost.cpuTimeMs <= left.cpuTimeMs &&
+        cost.heapBytes <= left.heapBytes;
     }
 
     // The most time the callouts of one transaction may take in total, in milliseconds. Salesforce
