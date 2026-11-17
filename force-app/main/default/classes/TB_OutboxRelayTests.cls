@@ -2339,4 +2339,117 @@ public class TB_OutboxRelayTests {
         System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The later message should not be delivered');
         System.assertEquals(null, outboxes[1].Last_Error_Message__c, 'The later message should carry no error');
     }
+
+    // Settings that cannot be read are judged again for each outbox, so a failure is never handed on to the next one.
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedThenEachOfItsOutboxesInTheRunFailsItsOwnAttempt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, faultyDef, 'billing_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        faulty.Retry_BackOff__c = '25';
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+
+        // Published alternately, so a healthy outbox sits between the two faulty ones.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newMessage(faultyDef),
+            newMessage(healthyDef),
+            newMessage(faultyDef),
+            newMessage(healthyDef)
+        };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 1, 1, 1 },
+            attemptsInOrder(),
+            'Every outbox should be attempted once in the one run'
+        );
+        for (Integer i : new List<Integer>{ 0, 2 }) {
+            System.assertEquals(
+                null,
+                outboxes[i].Completed_Timestamp__c,
+                'The outbox at position ' + i + ' with faulty settings should not be delivered'
+            );
+            assertErrorSaysSettingsCannotBeRead(outboxes[i]);
+            assertNextAttemptIsInMinutes(
+                outboxes[i],
+                25,
+                'The outbox at position ' + i + ' should wait on its subscription\'s backoff.'
+            );
+        }
+        for (Integer i : new List<Integer>{ 1, 3 }) {
+            System.assertNotEquals(
+                null,
+                outboxes[i].Completed_Timestamp__c,
+                'The healthy outbox at position ' + i + ' should be delivered'
+            );
+            System.assertEquals(null, outboxes[i].Last_Error_Message__c, 'The healthy outbox should carry no error');
+        }
+        System.assertEquals(2, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the healthy outboxes should be sent');
+    }
+
+    // The message is resolved before anything is sent, and settings are only judged for a send.
+    @isTest
+    static void testWhenResolverFailsAndSubscriptionSettingsAreMalformedThenTheResolverFailureIsRecorded() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        msgDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.ThrowingResolver';
+        addTestClientSubscription(app, msgDef, 'billing_feed').Config__c = MALFORMED_SETTINGS;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted once');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assert(
+            outbox.Last_Error_Message__c.startsWith('Resolver Error'),
+            'The outbox should carry the resolver error, but has: ' + outbox.Last_Error_Message__c
+        );
+    }
+
+    // Only the relay client can judge its settings, so a client that cannot be built is the reason given.
+    @isTest
+    static void testWhenRelayClientCannotBeBuiltAndSubscriptionSettingsAreMalformedThenTheClientFailureIsRecorded() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+        subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.NoSuchClient';
+        subscription.Config__c = MALFORMED_SETTINGS;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted once');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assert(
+            outbox.Last_Error_Message__c.startsWith('TB_TransactionOutboxTestUtils.NoSuchClient does not exist'),
+            'The outbox should carry the construction error, but has: ' + outbox.Last_Error_Message__c
+        );
+    }
+
+    // A subscription may have no settings at all. That is left for its relay client to judge, and the test client needs none.
+    @isTest
+    static void testWhenSubscriptionHasNoSettingsThenOutboxIsDelivered() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+        subscription.Config__c = null;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'The outbox should be delivered');
+        System.assertEquals(null, outbox.Last_Error_Message__c, 'The outbox should carry no error');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'The outbox should be sent');
+    }
 }
