@@ -189,13 +189,15 @@ The run does not yet check the remaining platform limits before each attempt. A 
 
 ### Record Cleanup
 
-Record removal is managed via the `Subscription Outbox -> TTL` (time-to-live) field.  Once the TTL has expired, the records will be deleted. 
+Record removal is managed via the `Subscription Outbox -> TTL` (time-to-live) field. Cleanup removes a delivered outbox once its TTL has passed. An outbox that has not been delivered is not removed, whatever its TTL. An outbox with no TTL is not removed.
+
+One run removes at most 4,000 outboxes and 4,000 messages, so it stays inside the limits of one transaction. Anything left over is removed by later runs.
 
 This TTL can either be set by the relay client, by using the subscription metadata `TTL Offset` & `Mark TTL Event` or by any other process.
 
-The `TB_OutboxCleanup` job can be scheduled in order to automatically remove records that have expired.  
+The `TB_OutboxCleanup` job can be scheduled in order to automatically remove delivered outboxes whose time to live has passed.
 
-`Outbox_Message__c` with no subscriptions will be removed by this job if the `Delete when outbox is empty` is checked.
+An `Outbox_Message__c` is removed by this job when it has no outboxes left and its message definition has `Delete when outbox is empty` checked.
 
 ### After Relay Actions
 

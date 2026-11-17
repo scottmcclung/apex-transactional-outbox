@@ -77,7 +77,7 @@ OUTBOX_ORG=outbox-dev node reproduce.js malformed-config
 | `missing-definition` | A message whose definition is gone fails the run before anything is saved. |
 | `bad-action-class` | A wrong after-relay action class name stops every run. |
 | `action-called-with-null` | An after-relay action is called for a subscription that had no attempt. |
-| `cleanup` | The cleanup job selects the wrong outboxes, and an exception hides it. |
+| `cleanup` | Cleanup removes a delivered outbox whose TTL has passed, keeps one whose TTL is ahead, and runs without an exception. |
 | `blank-max-attempts` | An outbox with no max attempts is dead-lettered at once. |
 
 Each scenario puts the faulty item first and a healthy message behind it, so the effect on other messages is visible.
