@@ -1576,11 +1576,13 @@ public class TB_OutboxRelayTests {
 
     static TB_Message_Subscription__mdt subscriptionToRestore;
     static TB_Message_Definition__mdt definitionToRestore;
+    static TB_Message_Subscription__mdt subscriptionToCorrect;
+    static String correctedSettings;
     static Boolean configurationRestored = false;
 
     /**
      * Stands in for what happens between two runs: the removed configuration is put back under
-     * the same name, the retry wait passes, and a later run starts.
+     * the same name or the faulty settings are corrected, the retry wait passes, and a later run starts.
      *
      * A test cannot act between two runs itself, because every queued job runs inside Test.stopTest().
      * An after-relay action is called once the first run's outcomes are stored, so a test puts this
@@ -1599,6 +1601,9 @@ public class TB_OutboxRelayTests {
             }
             if (definitionToRestore != null) {
                 TB_OutboxMetadataProvider.msgDefinitions.add(definitionToRestore);
+            }
+            if (subscriptionToCorrect != null) {
+                subscriptionToCorrect.Config__c = correctedSettings;
             }
 
             List<TB_Subscription_Outbox__c> waiting = [
@@ -1912,6 +1917,425 @@ public class TB_OutboxRelayTests {
             attemptsInOrder(),
             'The first message should fail one attempt and the later one in its group should not be attempted'
         );
+        System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The later message should not be delivered');
+        System.assertEquals(null, outboxes[1].Last_Error_Message__c, 'The later message should carry no error');
+    }
+
+    // Cut off part-way, so it cannot be parsed as JSON at all.
+    static final String MALFORMED_SETTINGS = '{"throwError":';
+
+    /**
+     * Runs the queued relay job. A job that ends with an unhandled exception is thrown out of
+     * Test.stopTest(), so reaching the end of this method means the run finished as a completed job.
+     */
+    static void stopTestExpectingNoFailedJob() {
+        try {
+            Test.stopTest();
+        } catch (Exception e) {
+            System.assert(
+                false,
+                'The run should end without a failed job, but it failed with ' + e.getTypeName() + ': ' + e.getMessage()
+            );
+        }
+    }
+
+    static void assertErrorSaysSettingsCannotBeRead(TB_Subscription_Outbox__c outbox) {
+        System.assertNotEquals(
+            null,
+            outbox.Last_Error_Message__c,
+            'The reason should be recorded on the outbox for ' + outbox.Subscription__c
+        );
+        System.assert(
+            outbox.Last_Error_Message__c.contains('Config__c'),
+            'The error should name the field whose settings cannot be read, but is: ' + outbox.Last_Error_Message__c
+        );
+        System.assert(
+            outbox.Last_Error_Message__c.contains(outbox.Subscription__c),
+            'The error should name the subscription whose settings cannot be read, but is: ' + outbox.Last_Error_Message__c
+        );
+    }
+
+    /**
+     * Settings that cannot be read are found when the outbox is attempted, not when it is published,
+     * so each of these tests can publish with the faulty settings already in place.
+     */
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedThenOneAttemptFailsAndWaitsForTheSubscriptionBackoff() {
+        // Differs from the subscription's backoff, so the two waits cannot be mistaken for each other.
+        setFallbackRetryWait(45);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+        subscription.Config__c = MALFORMED_SETTINGS;
+        subscription.Retry_BackOff__c = '25,50';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted');
+        System.assertNotEquals(null, outbox.Last_Attempt__c, 'The time of the attempt should be recorded');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        assertErrorSaysSettingsCannotBeRead(outbox);
+        assertNextAttemptIsInMinutes(
+            outbox,
+            25,
+            'The subscription exists, so its own backoff applies and the fallback does not.'
+        );
+        System.assertEquals(false, outbox.Dead_Lettered__c, 'One failed attempt of three should not dead-letter the outbox');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedThenOutboxDeadLettersAtMaxAttempts() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'billing_feed').Config__c = MALFORMED_SETTINGS;
+
+        // The outbox is created with the subscription's maximum of three attempts.
+        Test.startTest();
+        insert newMessage(msgDef);
+        setRelayAttempts(0, 2);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(3, outbox.Relay_Attempts__c, 'The third attempt should be counted');
+        System.assertEquals(true, outbox.Dead_Lettered__c, 'The outbox should be dead-lettered at its maximum attempts');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        assertErrorSaysSettingsCannotBeRead(outbox);
+    }
+
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedThenLaterOutboxesInTheRunAreRelayed() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, faultyDef, 'billing_feed').Config__c = MALFORMED_SETTINGS;
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+
+        // The outbox with the faulty settings is published first, so the run reaches it first.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(faultyDef), newMessage(healthyDef) };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Both outboxes should be attempted in the one run');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with faulty settings should not be delivered');
+        assertErrorSaysSettingsCannotBeRead(outboxes[0]);
+        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The outbox behind it should be delivered');
+        System.assertEquals(null, outboxes[1].Last_Error_Message__c, 'The healthy outbox should carry no error');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the healthy outbox should be sent');
+    }
+
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedThenEarlierOutboxesInTheRunAreRelayed() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, faultyDef, 'billing_feed').Config__c = MALFORMED_SETTINGS;
+
+        // The healthy outbox is published first, so the run reaches the faulty settings after a delivery.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(healthyDef), newMessage(faultyDef) };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(new List<Integer>{ 1, 1 }, attemptsInOrder(), 'Both outboxes should be attempted in the one run');
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox ahead of it should be delivered');
+        System.assertEquals(null, outboxes[0].Last_Error_Message__c, 'The healthy outbox should carry no error');
+        System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The outbox with faulty settings should not be delivered');
+        assertErrorSaysSettingsCannotBeRead(outboxes[1]);
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the healthy outbox should be sent');
+    }
+
+    /**
+     * An outbox that failed on its settings and is waiting on its backoff is not due, so the run's
+     * finalizer has nothing to start another run for. The healthy outbox goes first so the run
+     * reaches the test client, which is what frees the finalizer to queue.
+     */
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedThenTheWaitingOutboxDoesNotStartAnotherRun() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, faultyDef, 'billing_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        faulty.Retry_BackOff__c = '25';
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(healthyDef), newMessage(faultyDef) };
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        stopTestExpectingNoFailedJob();
+
+        assertFinalizerWasFreeToQueue();
+        System.assertEquals(1, relayJobCount(), 'An outbox waiting on its backoff should not start another run');
+        System.assertEquals(
+            new List<Integer>{ 1, 1 },
+            attemptsInOrder(),
+            'Each outbox should have exactly one attempt, from the one run'
+        );
+    }
+
+    /**
+     * With the definition gone nothing can be sent, whatever the settings say, so the missing
+     * definition is the reason given and the subscription's own backoff still decides the wait.
+     */
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedAndDefinitionIsMissingThenOneAttemptFailsAndTheRunCarriesOn() {
+        setFallbackRetryWait(45);
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt removed = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, removed, 'billing_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        faulty.Retry_BackOff__c = '25,50';
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+
+        // The outbox with the faulty settings and no definition is published first, so the run reaches it first.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(removed), newMessage(healthyDef) };
+        removeMessageDefinition(removed);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 1 },
+            attemptsInOrder(),
+            'The faulty outbox should be counted once, not once for each fault, and the healthy one attempted'
+        );
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The faulty outbox should not be delivered');
+        System.assertNotEquals(null, outboxes[0].Last_Attempt__c, 'The time of the attempt should be recorded');
+        System.assertNotEquals(null, outboxes[0].Last_Error_Message__c, 'The reason should be recorded on the outbox');
+        System.assert(
+            outboxes[0].Last_Error_Message__c.contains('test.message1') &&
+                outboxes[0].Last_Error_Message__c.containsIgnoreCase('definition'),
+            'The error should say the message type has no definition, but is: ' + outboxes[0].Last_Error_Message__c
+        );
+        assertNextAttemptIsInMinutes(
+            outboxes[0],
+            25,
+            'The subscription exists, so its own backoff applies and the fallback does not.'
+        );
+        System.assertNotEquals(null, outboxes[1].Completed_Timestamp__c, 'The outbox behind it should be delivered');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the healthy outbox should be sent');
+    }
+
+    @isTest
+    static void testWhenMalformedSubscriptionSettingsAreCorrectedThenOutboxIsDelivered() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, faultyDef, 'billing_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        // With a backoff the first run leaves the outbox waiting, so only the correcting action starts the second run.
+        faulty.Retry_BackOff__c = '30';
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed')
+            .After_Relay_Action__c = 'TB_OutboxRelayTests.RestoreConfigurationAction';
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(faultyDef), newMessage(healthyDef) };
+        subscriptionToCorrect = faulty;
+        correctedSettings = '{"log": "hello"}';
+        stopTestExpectingNoFailedJob();
+
+        System.assert(configurationRestored, 'The first run should finish and the settings should be corrected');
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals('billing_feed', outbox.Subscription__c);
+        System.assertEquals(
+            2,
+            outbox.Relay_Attempts__c,
+            'The first run should fail one attempt and the second should make another'
+        );
+        System.assertNotEquals(
+            null,
+            outbox.Completed_Timestamp__c,
+            'The outbox should be delivered once its subscription\'s settings can be read'
+        );
+        System.assertEquals(
+            2,
+            TB_TransactionOutboxTestUtils.sentMessages.size(),
+            'The healthy outbox is sent in the first run and the corrected one in the second'
+        );
+    }
+
+    /**
+     * A relay client is handed the settings as a set of named values. JSON that parses but is a list,
+     * a text or a number cannot be handed over that way, so it is as unreadable as JSON that does not parse.
+     */
+    @isTest
+    static void testWhenSubscriptionSettingsAreNotAJsonObjectThenOneAttemptFailsForEach() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        // Named so that the outboxes of the one message come back in this order.
+        addTestClientSubscription(app, msgDef, 'feed1_list').Config__c = '["throwError"]';
+        addTestClientSubscription(app, msgDef, 'feed2_text').Config__c = '"throwError"';
+        addTestClientSubscription(app, msgDef, 'feed3_number').Config__c = '7';
+        addTestClientSubscription(app, msgDef, 'feed4_healthy');
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 1, 1, 1 },
+            attemptsInOrder(),
+            'Every outbox should be attempted once in the one run'
+        );
+        for (Integer i = 0; i < 3; i++) {
+            System.assertEquals(
+                null,
+                outboxes[i].Completed_Timestamp__c,
+                'The outbox for ' + outboxes[i].Subscription__c + ' should not be delivered'
+            );
+            assertErrorSaysSettingsCannotBeRead(outboxes[i]);
+        }
+        System.assertNotEquals(null, outboxes[3].Completed_Timestamp__c, 'The healthy outbox should be delivered');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Only the healthy outbox should be sent');
+    }
+
+    /**
+     * An attempt that fails on its settings is an ordinary attempt of the run. For an isolated
+     * subscription it is the run's isolated attempt, so the run attempts nothing after it.
+     */
+    @isTest
+    static void testWhenIsolatedSubscriptionSettingsAreMalformedThenItFailsAndLaterOutboxesArePassedOver() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, faultyDef, 'isolated_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        faulty.Isolate_Relay__c = true;
+        // With a backoff the failed outbox is not due again, so a later run cannot add to its attempts.
+        faulty.Retry_BackOff__c = '25';
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+
+        // The isolated outbox with the faulty settings is published first, so it is the run's first attempt.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(faultyDef), newMessage(healthyDef) };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The isolated outbox should fail one attempt and the healthy one should be passed over'
+        );
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with faulty settings should not be delivered');
+        assertErrorSaysSettingsCannotBeRead(outboxes[0]);
+        System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The healthy outbox should wait for a later run');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    // The failed attempt is one of the run's attempts, so the isolated outbox behind it is not first.
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedAheadOfAnIsolatedOutboxThenTheIsolatedOneIsPassedOver() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, faultyDef, 'billing_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        faulty.Retry_BackOff__c = '25';
+        TB_Message_Definition__mdt isolatedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, isolatedDef, 'isolated_feed').Isolate_Relay__c = true;
+
+        // The outbox with the faulty settings is published first, so the run reaches it first.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(faultyDef), newMessage(isolatedDef) };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The faulty settings should fail one attempt and the isolated outbox should be passed over'
+        );
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox with faulty settings should not be delivered');
+        assertErrorSaysSettingsCannotBeRead(outboxes[0]);
+        System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The isolated outbox should wait for a later run');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    /**
+     * Settings are only judged once an attempt has started, and no attempt starts after the run's
+     * isolated attempt. This is where faulty settings differ from missing configuration, which is
+     * failed even behind an isolated attempt.
+     */
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedBehindAnIsolatedOutboxThenItIsNotAttempted() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt isolatedDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, isolatedDef, 'isolated_feed').Isolate_Relay__c = true;
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, faultyDef, 'billing_feed').Config__c = MALFORMED_SETTINGS;
+
+        // The isolated outbox is published first, so it is the run's first attempt.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(isolatedDef), newMessage(faultyDef) };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The isolated outbox should be attempted and the one with faulty settings should be passed over'
+        );
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The isolated outbox should be delivered');
+        System.assertEquals(null, outboxes[1].Last_Error_Message__c, 'An outbox that was not attempted should carry no error');
+        System.assertEquals(null, outboxes[1].Next_Attempt_Timestamp__c, 'An outbox that was not attempted should not wait');
+    }
+
+    // An isolated outbox that is not first is passed over before its settings are looked at.
+    @isTest
+    static void testWhenIsolatedSubscriptionSettingsAreMalformedAndItIsNotFirstThenItIsNotAttempted() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt healthyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, healthyDef, 'shipping_feed');
+        TB_Message_Definition__mdt faultyDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, faultyDef, 'isolated_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        faulty.Isolate_Relay__c = true;
+
+        // The healthy outbox is published first, so the isolated one is not the run's first attempt.
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(healthyDef), newMessage(faultyDef) };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The healthy outbox should be attempted and the isolated one should be passed over'
+        );
+        System.assertNotEquals(null, outboxes[0].Completed_Timestamp__c, 'The healthy outbox should be delivered');
+        System.assertEquals(null, outboxes[1].Last_Error_Message__c, 'An outbox that was not attempted should carry no error');
+        System.assertEquals(null, outboxes[1].Next_Attempt_Timestamp__c, 'An outbox that was not attempted should not wait');
+    }
+
+    @isTest
+    static void testWhenSubscriptionSettingsAreMalformedThenLaterMessagesInItsGroupAreHeld() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt faulty = addTestClientSubscription(app, msgDef, 'billing_feed');
+        faulty.Config__c = MALFORMED_SETTINGS;
+        faulty.Retry_BackOff__c = '25';
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{
+            newGroupedMessage(msgDef, 'group1'),
+            newGroupedMessage(msgDef, 'group1')
+        };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(
+            new List<Integer>{ 1, 0 },
+            attemptsInOrder(),
+            'The first message should fail one attempt and the later one in its group should not be attempted'
+        );
+        assertErrorSaysSettingsCannotBeRead(outboxes[0]);
         System.assertEquals(null, outboxes[1].Completed_Timestamp__c, 'The later message should not be delivered');
         System.assertEquals(null, outboxes[1].Last_Error_Message__c, 'The later message should carry no error');
     }
