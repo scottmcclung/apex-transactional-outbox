@@ -247,11 +247,15 @@ A relay run attempts at most `Relay Batch Size` outboxes, oldest first, and leav
 
 The value is set on the `TB Framework Settings` custom metadata record named `Default`. The record ships with a value of 100. The relay does not assume a value: if the record is missing, or the value is not from 1 to 1000, every relay run fails with an error that says so.
 
-Keep the batch size at or under 100 when relay clients make one callout per send, because a transaction allows 100 callouts.
+A run stops by itself when it has no callouts left, so a batch size above 100 does not make a run fail when relay clients make one callout per send. Such a run still loads every outbox in its batch, and the ones it passes over cost heap for nothing.
 
 An outbox that is already held when the run starts does not count toward the batch size. An outbox that becomes held during the run, because an earlier message in its group failed, has already been chosen. It is not attempted and its place is not given to another outbox. A run reads up to 10 pages of due outboxes, each twice the batch size, while it looks for outboxes it can attempt.
 
-Before each attempt the run compares the relay client's `costOfSend` with what it has left of each limit. An outbox it has no room for is left as it is, without being charged an attempt, and the next run takes it up. If a limit is hit anyway, the `TransactionalFinalizer` should result in the Relay Results being properly recorded.
+Before each attempt the run compares the relay client's `costOfSend` with what it has left of each limit. An outbox it has no room for is left as it is, without being charged an attempt, and the next run takes it up.
+
+The platform does not report how much callout time a transaction has used, so the run counts time on the clock from just before it calls the message resolvers. Time spent in resolvers and in any other processing from then on counts against the 120 seconds, as well as time spent waiting on callouts.
+
+A send or a message resolver can still reach a limit. When the platform's error can be caught, as it can for the 120 seconds of callout time, the attempt is abandoned. It is not counted, no error or wait is recorded against the outbox, and a TTL the relay client set during the attempt is put back. The outbox keeps its attempt time and whatever the attempt logged. The run starts nothing more, saves its outcomes, and the next run takes the outbox up. An abandoned attempt leaves no error on the outbox, and for now the only record of why it was abandoned is the debug log. A limit the platform does not let code catch ends the job. When that happens during a send, the run's finalizer saves the outcomes it already has, and the outbox whose attempt was cut off is left as it was.
 
 ### Record Cleanup
 
