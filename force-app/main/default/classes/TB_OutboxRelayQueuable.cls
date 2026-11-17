@@ -24,8 +24,13 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         outboxRecords
       );
   
+      Map<String, TB_Message_Definition__mdt> definitionsByName = TB_OutboxMetadataProvider.getMessageDefintionMap();
+
       // transform DTO's
-      Map<Id, Object> allResolvedMessages = resolveMessages(msgsByType);
+      Map<Id, Object> allResolvedMessages = resolveMessages(
+        msgsByType,
+        definitionsByName
+      );
   
       Map<String, TB_Message_Subscription__mdt> subscriptionsMetadataMap = TB_OutboxMetadataProvider.getMessageSubscritionMap(
         msgsByType.keySet()
@@ -410,10 +415,9 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      * Bulk Resolve Messages.
      */
     private static Map<Id, Object> resolveMessages(
-      Map<String, TB_Outbox_Message__c[]> msgsByType
+      Map<String, TB_Outbox_Message__c[]> msgsByType,
+      Map<String, TB_Message_Definition__mdt> definitionsByLabel
     ) {
-      Map<String, TB_Message_Definition__mdt> definitionsByLabel = TB_OutboxMetadataProvider.getMessageDefintionMap();
-  
       //resolve Message DTO
       Map<Id, Object> allResolvedMessages = new Map<Id, Object>();
       for (String msgType : msgsByType.keySet()) {

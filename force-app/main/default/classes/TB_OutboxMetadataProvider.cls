@@ -20,6 +20,16 @@ public class TB_OutboxMetadataProvider {
     @testVisible
     static TB_Message_Subscription__mdt[] subscriptions;
     public static Map<String, TB_Message_Subscription__mdt> getMessageSubscritionMap(Set<String> msgTypes) {
+        Map<String, TB_Message_Subscription__mdt> subscriptionsByLabel = new Map<String, TB_Message_Subscription__mdt>();
+        for (TB_Message_Subscription__mdt sub : loadSubscriptions()) {
+            if (msgTypes.contains(sub.Message_Definition__r.DeveloperName)) {
+                subscriptionsByLabel.put(sub.DeveloperName, sub);
+            }
+        }
+        return subscriptionsByLabel;
+    }
+
+    private static TB_Message_Subscription__mdt[] loadSubscriptions() {
         if (subscriptions == null) {
             subscriptions = [
                 SELECT
@@ -38,14 +48,7 @@ public class TB_OutboxMetadataProvider {
                 FROM TB_Message_Subscription__mdt
             ];
         }
-
-        Map<String, TB_Message_Subscription__mdt> subscriptionsByLabel = new Map<String, TB_Message_Subscription__mdt>();
-        for (TB_Message_Subscription__mdt sub : subscriptions) {
-            if (msgTypes.contains(sub.Message_Definition__r.DeveloperName)) {
-                subscriptionsByLabel.put(sub.DeveloperName, sub);
-            }
-        }
-        return subscriptionsByLabel;
+        return subscriptions;
     }
 
     @testVisible
@@ -62,6 +65,20 @@ public class TB_OutboxMetadataProvider {
      * so a missing record or value is an error and never a silently assumed number.
      */
     public static Integer getRelayBatchSize() {
+        Decimal batchSize = defaultFrameworkSettings().Relay_Batch_Size__c;
+        if (batchSize == null || batchSize < 1 || batchSize > MAX_RELAY_BATCH_SIZE) {
+            throw new TB_InvalidConfigException(
+                'Relay_Batch_Size__c on the TB_Framework_Settings__mdt record named Default must be from 1 to ' +
+                    MAX_RELAY_BATCH_SIZE +
+                    '. It is ' +
+                    batchSize +
+                    '.'
+            );
+        }
+        return batchSize.intValue();
+    }
+
+    private static TB_Framework_Settings__mdt defaultFrameworkSettings() {
         if (frameworkSettings == null) {
             frameworkSettings = [
                 SELECT DeveloperName, Relay_Batch_Size__c
@@ -74,18 +91,7 @@ public class TB_OutboxMetadataProvider {
                 'No TB_Framework_Settings__mdt record named Default was found. The relay needs it for Relay_Batch_Size__c.'
             );
         }
-
-        Decimal batchSize = frameworkSettings[0].Relay_Batch_Size__c;
-        if (batchSize == null || batchSize < 1 || batchSize > MAX_RELAY_BATCH_SIZE) {
-            throw new TB_InvalidConfigException(
-                'Relay_Batch_Size__c on the TB_Framework_Settings__mdt record named Default must be from 1 to ' +
-                    MAX_RELAY_BATCH_SIZE +
-                    '. It is ' +
-                    batchSize +
-                    '.'
-            );
-        }
-        return batchSize.intValue();
+        return frameworkSettings[0];
     }
 
     static Map<String, Map<String, Object>> configCache = new Map<String, Map<String, Object>>();
