@@ -54,15 +54,33 @@ _The above diagram is a conceptual abstraction for the key aspects of the framew
 
 ## Usage
 
-### 0. Install & Setup
+### 0. Install & Activate
+
+Installing and activating are separate steps. The framework can be installed without being activated.
+
+To install:
 
 1. git clone project
-2. `sf deploy metadata -x manifest/package.xml -o your_org_alias`
+2. `sf project deploy start -x manifest/package.xml -o your_org_alias`
 3. Add `TB_Admin` permission set to Users or Permission Set Groups
 
-After installing the package, run the following anonymous apex to schedule the "Outbox Relay" cleanup process:
+Activating means scheduling two jobs: the relay sweep (`TB_ScheduleRelay`) and the cleanup job (`TB_RecordCleanup`). The team that activates the framework chooses how often each job runs. That team also checks that both jobs are in place. The framework has no setting for either interval and does not check for the jobs.
+
+Until the sweep is scheduled, a relay run starts only when a message is published, a run hands over to the next, or someone runs `TB_OutboxRelayQueuable.enqueue(null)` as anonymous Apex. See "Dead-Lettered" below. The sweep is what picks up an outbox whose retry wait has ended when nothing else starts a run. The sweep interval is the longest that outbox waits.
+
+Until cleanup is scheduled, no record is removed.
+
+`post-install/schedule.apex` is an example that schedules both jobs to run every hour. Change it to suit your org, then run it:
 
 `sf apex run -f post-install/schedule.apex -o your_org_alias`
+
+If a job with either name already exists, the script fails and schedules nothing. Remove that job, or delete its line from the script, then run it again.
+
+A Salesforce scheduled job fires at most once an hour from one schedule expression. A schedule finer than hourly needs several jobs at different minutes. For example, a sweep every 15 minutes needs four jobs, at minutes 0, 15, 30 and 45.
+
+To confirm both jobs are scheduled, run this query. It should return at least one row for `TB_ScheduleRelay` and one for `TB_RecordCleanup`.
+
+`sf data query -o your_org_alias -q "SELECT ApexClass.Name, CronTrigger.CronExpression, CronTrigger.NextFireTime FROM AsyncApexJob WHERE JobType = 'ScheduledApex' AND Status = 'Queued'"`
 
 ### 1. Create an "Application"
 `Custom Metadata Types -> TB Application -> Manage Records -> New`
@@ -195,7 +213,7 @@ One run removes at most 4,000 outboxes and 4,000 messages, so it stays inside th
 
 This TTL can either be set by the relay client, by using the subscription metadata `TTL Offset` & `Mark TTL Event` or by any other process.
 
-The `TB_OutboxCleanup` job can be scheduled in order to automatically remove delivered outboxes whose time to live has passed.
+The `TB_RecordCleanup` job removes delivered outboxes whose time to live has passed. It runs only once it is scheduled during activation. See "Install & Activate" above.
 
 An `Outbox_Message__c` is removed by this job when it has no outboxes left and its message definition has `Delete when outbox is empty` checked.
 
