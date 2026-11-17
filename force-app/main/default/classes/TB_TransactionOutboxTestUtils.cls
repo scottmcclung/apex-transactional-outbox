@@ -98,6 +98,28 @@ public class TB_TransactionOutboxTestUtils {
         }
     }
 
+    // A message with this payload makes RecordingResolver fail the whole call the message is in.
+    public static final String UNRESOLVABLE_PAYLOAD = 'Cannot Be Resolved';
+
+    // One entry per call to RecordingResolver.resolveMessages, holding the argument as it was passed.
+    // It is a list, so a message passed twice in one call shows up twice.
+    // The argument is recorded before it is read, so a call that then fails is still recorded.
+    @testVisible
+    static List<List<TB_Outbox_Message__c>> resolverCalls = new List<List<TB_Outbox_Message__c>>();
+    public class RecordingResolver implements TB_IOutboxMessageResolver {
+        public Map<Id, Object> resolveMessages(TB_Outbox_Message__c[] messages) {
+            resolverCalls.add(messages);
+            Map<Id, Object> result = new Map<Id, Object>();
+            for (TB_Outbox_Message__c msg : messages) {
+                if (msg.Message__c == UNRESOLVABLE_PAYLOAD) {
+                    throw new TestException('Resolver Error');
+                }
+                result.put(msg.Id, 'resolved:' + msg.Message__c);
+            }
+            return result;
+        }
+    }
+
     // One entry per call to RecordingAction.execute, holding the argument as it was passed.
     // The argument is recorded before it is read, so a null shows up here even though the action
     // then throws on it.
