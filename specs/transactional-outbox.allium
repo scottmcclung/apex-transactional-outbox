@@ -229,6 +229,10 @@ contract RelayClient {
         -- Deciding what a message contains is the message definition's job
         -- and its resolver's. A relay client delivers what it is given. It
         -- should not take on shaping the message for its subscriber.
+        --
+        -- A client runs as the framework's own identity. Any credentials it
+        -- uses and any records it reads must be available to that identity.
+        -- They must not depend on who published the message.
 }
 
 -- What the framework requires of any system that receives messages,
@@ -488,6 +492,12 @@ entity SubscriptionOutbox {
 }
 
 -- One pass over the outbox.
+--
+-- A run acts as the framework's own identity. That identity is fixed. It is
+-- the same for every run, whatever started it, and nobody chooses it. A run
+-- never acts as the publisher of a message it relays, because one run relays
+-- messages from many publishers. Who published a message plays no part in
+-- how it is relayed.
 entity RelayRun {
     status: running | finished
 
@@ -636,6 +646,17 @@ rule StartRelayRun {
     requires: not RelayRuns.any(r => r.status = running)
 
     ensures: RelayRun.created(status: running)
+
+    @guidance
+        -- Every request comes through here, whether it was raised by a
+        -- publish, by the sweep, by an operator or by a run that has just
+        -- finished. Requests are taken one at a time, so two made at the
+        -- same moment still start only one run.
+        --
+        -- A request raised by a publish records who published, when that is
+        -- known. It may be absent. It is there for tracing only: nothing
+        -- about the run depends on it, and it is not passed to relay
+        -- clients, resolvers, after-relay actions or log adapters.
 }
 
 rule OfferRelayTurns {
@@ -1270,6 +1291,13 @@ surface Publishing {
         -- message more than once. Every attempt carries the outbox's
         -- idempotency key, which lets the subscriber discard a repeat.
 
+    @guarantee RelayRequestNeverLostToThePublisher
+        -- Publishing a message always asks for a relay run. The request is
+        -- never lost because of what else the publisher's own transaction
+        -- has done, or where the publisher is running. It is dropped only
+        -- while a run is already in progress, and that run starts another
+        -- if work remains.
+
     @guarantee GroupOrder
         -- Within a group, a subscription never receives a message before
         -- every earlier message in that group has been delivered to it,
@@ -1394,6 +1422,12 @@ surface RelayClientIntegration {
         -- names. The test fails if any client rejects its settings, or if
         -- a subscription names something that is not a relay client.
 
+    @guarantee RunsAsTheFramework
+        -- A relay client always runs as the framework's own identity. It is
+        -- the same for every attempt of every outbox, whoever published the
+        -- message and whatever started the run. The client is not told who
+        -- published the message.
+
     provides:
         RelaySucceeded(attempt)
         RelayFailed(attempt, reason)
@@ -1410,6 +1444,11 @@ surface MessageResolverIntegration {
         -- An acceptance test goes through every message definition that
         -- names a resolver. The test fails if the name does not lead to a
         -- message resolver.
+
+    @guarantee RunsAsTheFramework
+        -- A resolver always runs as the framework's own identity, whoever
+        -- published the messages it is given. What it can read is what that
+        -- identity can read, which may differ from what the publisher could.
 
     provides:
         MessageResolved(attempt, resolved_payload)
@@ -1429,6 +1468,11 @@ surface AfterRelayActionIntegration {
         -- An acceptance test goes through every subscription that names an
         -- after-relay action. The test fails if the name does not lead to
         -- an after-relay action.
+
+    @guarantee RunsAsTheFramework
+        -- An after-relay action always runs as the framework's own
+        -- identity, whoever published the messages. Anything it creates is
+        -- created by that identity.
 }
 
 surface LoggingIntegration {
@@ -1457,6 +1501,10 @@ surface LoggingIntegration {
         -- An acceptance test goes through every subscription and every
         -- application that names a log adapter. The test fails if a name
         -- does not lead to a log adapter.
+
+    @guarantee RunsAsTheFramework
+        -- A log adapter always runs as the framework's own identity.
+        -- Whatever it writes or sends, it does as that identity.
 }
 
 surface SubscriberObligations {
