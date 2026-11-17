@@ -4275,6 +4275,25 @@ public class TB_OutboxRelayTests {
     }
 
     /**
+     * Only a delivered or failed attempt keeps the TTL its client chose. A TTL left behind by an
+     * abandoned attempt would also stop a later delivery from setting its own.
+     */
+    @isTest
+    static void testWhenAbandonedAttemptReplacedTheTtlThenTheEarlierTtlIsKept() {
+        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit();
+
+        System.assertNotEquals(null, outbox.TTL__c, 'The TTL the outbox was created with should be kept');
+        // A minute either side, because the trigger and the test read the clock at different moments.
+        System.assert(
+            Datetime.now().addMinutes(59) < outbox.TTL__c && Datetime.now().addMinutes(61) > outbox.TTL__c,
+            'The TTL should be the hour the outbox was created with, not the ' +
+                TB_TransactionOutboxTestUtils.REQUESTED_TTL_DAYS +
+                ' days the client asked for, but it is ' +
+                outbox.TTL__c
+        );
+    }
+
+    /**
      * A resolver's callouts use the same callout time as the sends. Running out of it there is the
      * run's doing too, so the attempt is abandoned the same way and the run starts nothing more.
      */

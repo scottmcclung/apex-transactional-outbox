@@ -218,6 +218,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         return AttemptOutcome.FAILED;
       }
 
+      // A client may replace the TTL during its send, and an abandoned attempt must not keep that.
+      Datetime ttlBeforeAttempt = item.TTL__c;
       AttemptOutcome outcome = AttemptOutcome.FAILED;
       try {
         obCtx.setAttempt();
@@ -233,7 +235,7 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         outcome = AttemptOutcome.DELIVERED;
       } catch (Exception e) {
         if (isRunLimitError(e)) {
-          abandon(obCtx, e);
+          abandon(obCtx, ttlBeforeAttempt, e);
           outcome = AttemptOutcome.ABANDONED;
         } else {
           obCtx.setError(e);
@@ -271,12 +273,19 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      * Undoes the parts of an attempt that would charge the outbox for a limit the run reached. That is
      * the run's doing and says nothing about the subscriber, so the attempt is not counted, no error is
      * recorded and no wait is added, not even one the client asked for. An outbox on its last attempt
-     * is therefore not dead-lettered. The attempt time and whatever the attempt logged are kept, so the
-     * outbox still shows that an attempt was started and how far it got.
+     * is therefore not dead-lettered. A TTL the client set during the attempt is put back to what the
+     * outbox had before it, because only a delivered or failed attempt keeps what the client chose.
+     * The attempt time and whatever the attempt logged are kept, so the outbox still shows that an
+     * attempt was started and how far it got.
      */
-    private static void abandon(TB_OutboxRelayContext obCtx, Exception e) {
+    private static void abandon(
+      TB_OutboxRelayContext obCtx,
+      Datetime ttlBeforeAttempt,
+      Exception e
+    ) {
       obCtx.outbox.Relay_Attempts__c--;
       obCtx.outbox.Next_Attempt_Timestamp__c = null;
+      obCtx.outbox.TTL__c = ttlBeforeAttempt;
       // PLANNED: report the abandoned attempt through the subscription's log adapter, so a client that
       // uses more than it declares gets noticed. Until then the debug log is the only record of why.
       System.debug(
