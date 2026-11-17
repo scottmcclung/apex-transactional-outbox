@@ -289,6 +289,37 @@ public class TB_TransactionOutboxTestUtils {
         }
     }
 
+    public static final String LOGGED_BEFORE_LIMIT = 'Request sent to the subscriber';
+    // Far from any wait or TTL a subscription in these tests sets, so a value the client set cannot
+    // be mistaken for one of those.
+    public static final Integer REQUESTED_WAIT_DAYS = 3;
+    public static final Integer REQUESTED_TTL_DAYS = 10;
+
+    /**
+     * Logs a line, asks for a next attempt time and replaces the TTL, the way a client shapes the
+     * outcome of its send, and then runs out of callout time.
+     */
+    public class ShapesOutcomeThenHitsCalloutTimeLimitClient implements TB_IOutboxRelayClient {
+        public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
+            return inMemorySendCost();
+        }
+
+        public void send(TB_OutboxRelayContext ctx) {
+            sentMessages.add(ctx.resolvedMessage);
+            ctx.log(LOGGED_BEFORE_LIMIT);
+            ctx.setNextAttemptTimestamp(System.now().addDays(REQUESTED_WAIT_DAYS));
+            ctx.setTTL(System.now().addDays(REQUESTED_TTL_DAYS));
+            throw new CalloutException(CALLOUT_TIME_LIMIT_ERROR);
+        }
+    }
+
+    /** A resolver whose own callouts use up the callout time of the run. */
+    public class CalloutTimeLimitResolver implements TB_IOutboxMessageResolver {
+        public Map<Id, Object> resolveMessages(TB_Outbox_Message__c[] messages) {
+            throw new CalloutException(CALLOUT_TIME_LIMIT_ERROR);
+        }
+    }
+
     @testVisible
     static Integer testExecuted = 0;
     public class TestResolver implements TB_IOutboxMessageResolver {

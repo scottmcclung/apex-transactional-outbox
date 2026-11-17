@@ -3897,8 +3897,9 @@ public class TB_OutboxRelayTests {
                 System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'Every attempt the run made should be saved as delivered');
             }
         }
-        System.assert(attempted > 0, 'The run should attempt the outboxes it has room for');
-        System.assert(attempted <= 100, 'The run should stop at 100 callouts or sooner, but it attempted ' + attempted);
+        // The bodies are small and the subscriber answers at once, so callouts run out before any
+        // other limit does.
+        System.assertEquals(100, attempted, 'The run should stop when its 100 callouts are used');
         System.assertEquals(
             attempted,
             TB_TransactionOutboxTestUtils.subscriberRequests,
@@ -4085,7 +4086,9 @@ public class TB_OutboxRelayTests {
     }
 
     /**
-     * Before the abandon rule this outbox was dead-lettered without its message ever being sent.
+     * Running out of callout time is the run's doing, and the subscriber has not turned the message
+     * down. Counting the attempt would dead-letter the message for a reason that has nothing to do
+     * with the subscriber, so the outbox keeps its last attempt for a run that has room to make it.
      */
     @isTest
     static void testWhenLastAttemptHitsTheCalloutTimeLimitThenOutboxIsNotDeadLettered() {
@@ -4169,5 +4172,135 @@ public class TB_OutboxRelayTests {
         );
         assertNextAttemptIsInMinutes(outboxes[1], 30, 'A failed attempt should wait on its subscription\'s backoff.');
         System.assertNotEquals(null, outboxes[2].Completed_Timestamp__c, 'The outbox after the failure should still be delivered');
+    }
+
+    /**
+     * The run needs the relay client to know what a send costs, and it checks that before an attempt
+     * starts. A failed resolution only fails an attempt that has started, so a client that cannot be
+     * built is found first and is the reason given.
+     */
+    @isTest
+    static void testWhenResolverFailsAndRelayClientCannotBeBuiltThenTheClientFailureIsRecorded() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        msgDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.ThrowingResolver';
+        TB_Message_Subscription__mdt subscription = addTestClientSubscription(app, msgDef, 'billing_feed');
+        subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.NoSuchClient';
+        subscription.Retry_BackOff__c = '25';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The attempt should be counted once');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assert(
+            outbox.Last_Error_Message__c.startsWith('TB_TransactionOutboxTestUtils.NoSuchClient does not exist'),
+            'The outbox should carry the construction error, but has: ' + outbox.Last_Error_Message__c
+        );
+        assertNextAttemptIsInMinutes(outbox, 25, 'The outbox should wait on its subscription\'s backoff.');
+    }
+
+    /**
+     * The room check comes before the attempt, and a failed resolution only fails an attempt that has
+     * started. An outbox the run has no room for is passed over, whatever its resolver did.
+     */
+    @isTest
+    static void testWhenResolverFailsAndRunHasNoRoomForTheSendThenOutboxIsUntouched() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        msgDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.ThrowingResolver';
+        // A backoff, so a wait would show if the resolver failure were recorded.
+        addDeclaredCostSubscription(
+                app,
+                msgDef,
+                'costly_feed',
+                TB_TransactionOutboxTestUtils.sendCostWith('callouts', 101)
+            )
+            .Retry_BackOff__c = '30';
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        assertOutboxIsUntouched(outboxesInOrder()[0], 'The run has no room for the send.');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
+    }
+
+    /**
+     * Relays one outbox whose client logs, asks for a next attempt time and replaces the TTL before
+     * it runs out of callout time. The outbox got a TTL of an hour when it was created.
+     */
+    static TB_Subscription_Outbox__c relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(app, msgDef, 'shaping_feed');
+        subscription.Relay_Client__c = 'TB_TransactionOutboxTestUtils.ShapesOutcomeThenHitsCalloutTimeLimitClient';
+        subscription.Retry_BackOff__c = '30';
+        subscription.Mark_TTL_Event__c = 'created';
+        subscription.TTL_Offset__c = 60;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = [
+            SELECT Relay_Attempts__c, Last_Error_Message__c, Next_Attempt_Timestamp__c, Log__c, TTL__c
+            FROM TB_Subscription_Outbox__c
+        ];
+        System.assertEquals(0, outbox.Relay_Attempts__c, 'An attempt that hit a run limit should not be counted');
+        System.assertEquals(null, outbox.Last_Error_Message__c, 'No error should be recorded against the outbox');
+        return outbox;
+    }
+
+    /** A wait the client asked for is part of how the attempt turned out, and the attempt does not count. */
+    @isTest
+    static void testWhenAbandonedAttemptAskedForANextAttemptTimeThenItIsCleared() {
+        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit();
+
+        System.assertEquals(null, outbox.Next_Attempt_Timestamp__c, 'The wait the client asked for should not be kept');
+    }
+
+    /** What the attempt logged shows how far it got before the run reached its limit. */
+    @isTest
+    static void testWhenAbandonedAttemptLoggedThenTheLogIsKept() {
+        TB_Subscription_Outbox__c outbox = relayToAClientThatShapesItsOutcomeThenHitsTheCalloutTimeLimit();
+
+        System.assertNotEquals(null, outbox.Log__c, 'What the attempt logged should be kept');
+        System.assert(
+            outbox.Log__c.contains(TB_TransactionOutboxTestUtils.LOGGED_BEFORE_LIMIT),
+            'The log should hold what the client wrote, but is: ' + outbox.Log__c
+        );
+    }
+
+    /**
+     * A resolver's callouts use the same callout time as the sends. Running out of it there is the
+     * run's doing too, so the attempt is abandoned the same way and the run starts nothing more.
+     */
+    @isTest
+    static void testWhenResolverHitsTheCalloutTimeLimitThenAttemptIsAbandonedAndNothingMoreIsStarted() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt limitDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        limitDef.Message_Resolver__c = 'TB_TransactionOutboxTestUtils.CalloutTimeLimitResolver';
+        // A backoff, so a wait would show if the attempt were recorded as a failure.
+        addTestClientSubscription(app, limitDef, 'resolved_feed').Retry_BackOff__c = '30';
+        TB_Message_Definition__mdt otherDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message2');
+        addTestClientSubscription(app, otherDef, 'other_feed');
+
+        Test.startTest();
+        insert new List<TB_Outbox_Message__c>{ newMessage(limitDef), newMessage(otherDef) };
+        stopTestExpectingNoFailedJob();
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(0, outboxes[0].Relay_Attempts__c, 'An attempt that hit a run limit should not be counted');
+        System.assertEquals(null, outboxes[0].Last_Error_Message__c, 'No error should be recorded against the outbox');
+        System.assertEquals(null, outboxes[0].Next_Attempt_Timestamp__c, 'No wait should be added');
+        System.assertEquals(null, outboxes[0].Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertEquals(false, outboxes[0].Dead_Lettered__c, 'The outbox should not be dead-lettered');
+        System.assertNotEquals(null, outboxes[0].Last_Attempt__c, 'The time the abandoned attempt started should be kept');
+
+        assertOutboxIsUntouched(outboxes[1], 'The run reached a limit before this outbox\'s turn.');
+        System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
     }
 }
