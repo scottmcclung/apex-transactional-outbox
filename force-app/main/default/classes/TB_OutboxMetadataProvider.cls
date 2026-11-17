@@ -29,6 +29,21 @@ public class TB_OutboxMetadataProvider {
         return subscriptionsByLabel;
     }
 
+    /**
+     * The subscriptions with these names, whatever message definition each is on now.
+     * An outbox is tied to its subscription by name alone, so a name with no subscription is
+     * left out and the caller treats that outbox as having no subscription.
+     */
+    public static Map<String, TB_Message_Subscription__mdt> getSubscriptionsByName(Set<String> names) {
+        Map<String, TB_Message_Subscription__mdt> subscriptionsByName = new Map<String, TB_Message_Subscription__mdt>();
+        for (TB_Message_Subscription__mdt sub : loadSubscriptions()) {
+            if (names.contains(sub.DeveloperName)) {
+                subscriptionsByName.put(sub.DeveloperName, sub);
+            }
+        }
+        return subscriptionsByName;
+    }
+
     private static TB_Message_Subscription__mdt[] loadSubscriptions() {
         if (subscriptions == null) {
             subscriptions = [
@@ -78,17 +93,36 @@ public class TB_OutboxMetadataProvider {
         return batchSize.intValue();
     }
 
+    /**
+     * Minutes an outbox waits before its next attempt when its subscription is missing,
+     * because there is then no retry backoff to read.
+     * It is read and checked at the start of every run, even a run with no such outbox,
+     * so a bad value stops the run before anything is attempted and never part-way through.
+     * Zero is accepted and means the next run may try again at once.
+     */
+    public static Integer getFallbackRetryWait() {
+        Decimal wait = defaultFrameworkSettings().Fallback_Retry_Wait__c;
+        if (wait == null || wait < 0) {
+            throw new TB_InvalidConfigException(
+                'Fallback_Retry_Wait__c on the TB_Framework_Settings__mdt record named Default must be a number of minutes, zero or more. It is ' +
+                    wait +
+                    '.'
+            );
+        }
+        return wait.intValue();
+    }
+
     private static TB_Framework_Settings__mdt defaultFrameworkSettings() {
         if (frameworkSettings == null) {
             frameworkSettings = [
-                SELECT DeveloperName, Relay_Batch_Size__c
+                SELECT DeveloperName, Relay_Batch_Size__c, Fallback_Retry_Wait__c
                 FROM TB_Framework_Settings__mdt
                 WHERE DeveloperName = 'Default'
             ];
         }
         if (frameworkSettings.isEmpty()) {
             throw new TB_InvalidConfigException(
-                'No TB_Framework_Settings__mdt record named Default was found. The relay needs it for Relay_Batch_Size__c.'
+                'No TB_Framework_Settings__mdt record named Default was found. The relay needs it for Relay_Batch_Size__c and Fallback_Retry_Wait__c.'
             );
         }
         return frameworkSettings[0];
