@@ -8,6 +8,8 @@ public class TB_GenericHttpRelayClientTests {
     // The longest body the message field holds. The client assumes no response is longer.
     static final Integer LONGEST_BODY_LENGTH = 131072;
 
+    static final Integer LOG_FIELD_LENGTH = TB_TransactionOutboxTestUtils.LONG_TEXT_FIELD_LENGTH;
+
     static TB_Message_Subscription__mdt addHttpSubscription(String name) {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
         TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
@@ -50,14 +52,25 @@ public class TB_GenericHttpRelayClientTests {
         }
     }
 
+    /** Gives no answer, the way a request fails when the subscriber does not reply in time. */
+    public class SilentSubscriber implements HttpCalloutMock {
+        public HttpResponse respond(HttpRequest req) {
+            throw new CalloutException(TB_TransactionOutboxTestUtils.READ_TIMEOUT_ERROR);
+        }
+    }
+
+    static TB_Subscription_Outbox__c relayOverHttp(String requestBody, Integer statusCode, String answer) {
+        return relayOverHttp(requestBody, new AnsweringSubscriber(statusCode, answer));
+    }
+
     /**
      * Publishes one message for an HTTP subscription and lets the relay run and its finalizer
      * finish, so the log and error read back are the ones an operator would see.
      */
-    static TB_Subscription_Outbox__c relayOverHttp(String requestBody, Integer statusCode, String answer) {
+    static TB_Subscription_Outbox__c relayOverHttp(String requestBody, HttpCalloutMock subscriber) {
         TB_Message_Subscription__mdt subscription = addHttpSubscription('http_feed');
         subscription.Retry_BackOff__c = '5';
-        Test.setMock(HttpCalloutMock.class, new AnsweringSubscriber(statusCode, answer));
+        Test.setMock(HttpCalloutMock.class, subscriber);
 
         Test.startTest();
         insert new TB_Outbox_Message__c(Type__c = 'test.message1', Message__c = requestBody);
@@ -298,6 +311,38 @@ public class TB_GenericHttpRelayClientTests {
             outbox.Log__c.contains(statusLine(200)),
             'The log should keep its end, which names the method, the endpoint and the status, but is ' +
             describe(outbox.Log__c)
+        );
+    }
+
+    /**
+     * With no answer there is no status line, so the log ends with what was logged before the send.
+     * For a body as long as the field, the method and the endpoint must still be in that end.
+     */
+    @isTest
+    static void testWhenSendGetsNoAnswerForBodyThatFillsTheLogThenLogStillNamesMethodAndEndpoint() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp('b'.repeat(LOG_FIELD_LENGTH), new SilentSubscriber());
+
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The failed attempt should be counted. A count of 0 means the outcome was not saved'
+        );
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assert(
+            outbox.Log__c.length() <= LOG_FIELD_LENGTH,
+            'The log should fit its field, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Log__c),
+            'The log should say it was shortened, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains('POST'),
+            'The log should keep its end, which names the method, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains(ENDPOINT),
+            'The log should keep its end, which names the endpoint, but is ' + describe(outbox.Log__c)
         );
     }
 
