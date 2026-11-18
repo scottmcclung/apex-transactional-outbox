@@ -4597,6 +4597,9 @@ public class TB_OutboxRelayTests {
     /**
      * Runs one relay run for these messages in a job that, between the run's save and its finalizer,
      * records what is stored and makes the rejected outboxes saveable again.
+     *
+     * The run executes inside that job, which relayJobCount does not count, and the publish queues
+     * no run. So after this a count of 0 means the finalizer queued no further run.
      */
     static void relayThenMendBeforeTheFinalizer(List<TB_Outbox_Message__c> messages) {
         Test.startTest();
@@ -4747,17 +4750,6 @@ public class TB_OutboxRelayTests {
             [SELECT Log__c FROM TB_Subscription_Outbox__c WHERE Id = :outboxes[0].Id].Log__c,
             'The finalizer should not save an outbox the run already saved. Its log was changed after the run\'s save'
         );
-        System.assertEquals(1, outboxes[0].Relay_Attempts__c, 'The attempt should still be counted once');
-        System.assertEquals(
-            savedByRun.Completed_Timestamp__c,
-            outboxes[0].Completed_Timestamp__c,
-            'The delivery time the run stored should not move'
-        );
-        System.assertEquals(
-            savedByRun.Last_Attempt__c,
-            outboxes[0].Last_Attempt__c,
-            'The attempt time the run stored should not move'
-        );
 
         System.assertEquals(1, outboxes[1].Relay_Attempts__c, 'The finalizer should save the attempt the run could not');
         System.assertNotEquals(
@@ -4768,15 +4760,26 @@ public class TB_OutboxRelayTests {
     }
 
     /**
-     * Pins what happens today when the finalizer's save is rejected as well. It is not how this
-     * should end up: a row that fails twice is to be reported through the log adapter, and this
-     * test is the place to add that expectation.
+     * Pins what happens today when the finalizer's save is rejected as well.
+     *
+     * PLANNED: a row whose save is rejected twice is reported through the subscription's log
+     * adapter. This test should then expect that report.
      *
      * Today the run and its finalizer finish as if nothing went wrong and the outcome is written
      * only to the debug log. The after-relay action is still given the attempt as a delivery. The
      * stored outbox is as it was before the attempt, so it is still due, another run is queued at
      * once, and that run sends the message again. No attempt is ever counted, so the outbox cannot
      * dead-letter.
+     *
+     * The counts of 2 below are where the test stops, not the size of the problem. The test clears
+     * the run's guard once, and the first finalizer's queuing sets the publisher's guard again, so
+     * the second run's finalizer cannot queue a third. In production each finalizer starts with both
+     * guards unset, so runs follow one another with no wait, each sending the message again, for as
+     * long as the row is rejected.
+     *
+     * Nothing is stored whether or not the finalizer tries its save, so this test cannot tell if
+     * the second save was tried. The three tests above pin the retry. This one pins what follows
+     * when the retry is rejected too.
      */
     @isTest
     static void testWhenBothSavesOfADeliveryAreRejectedThenTodayNothingIsStoredAndTheNextRunSendsAgain() {

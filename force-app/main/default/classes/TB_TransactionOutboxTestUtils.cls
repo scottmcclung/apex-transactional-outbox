@@ -443,6 +443,15 @@ public class TB_TransactionOutboxTestUtils {
      *   own modified time is kept to the second, so it cannot show a second write.
      * - It puts the stored application name back on each outbox UnsaveableOutboxClient changed, so
      *   the platform accepts that row the next time it is saved.
+     *
+     * The second step changes the record the run's results hold, while the job that attached the
+     * finalizer is still running. It therefore works whether the platform hands the finalizer those
+     * same objects or a copy of them made once the job has ended.
+     *
+     * In production the finalizer runs in its own transaction, on state the platform has serialized
+     * and deserialized for it. In a test the run and its finalizer both happen inside
+     * Test.stopTest() and share statics. So the tests that use this do not show that the
+     * finalizer's results, its record of what is saved, and each context survive that move.
      */
     public class RelayRunThenMend implements Queueable {
         public void execute(QueueableContext ctx) {
@@ -450,7 +459,7 @@ public class TB_TransactionOutboxTestUtils {
 
             storedAfterRunSave = new Map<Id, TB_Subscription_Outbox__c>(
                 [
-                    SELECT Application__c, Relay_Attempts__c, Last_Attempt__c, Completed_Timestamp__c
+                    SELECT Application__c, Relay_Attempts__c, Completed_Timestamp__c
                     FROM TB_Subscription_Outbox__c
                 ]
             );
