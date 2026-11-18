@@ -269,6 +269,39 @@ public class TB_GenericHttpRelayClientTests {
     }
 
     /**
+     * A response can be as long as the log field by itself. The log keeps its end, so whatever is
+     * logged after the response is what survives, and the method, endpoint and status must be there.
+     */
+    @isTest
+    static void testWhenResponseBodyFillsTheLogThenDeliveryIsSavedAndLogKeepsTheStatusLine() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp(REQUEST_BODY, 200, 'r'.repeat(LONGEST_BODY_LENGTH));
+
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The attempt should be counted. A count of 0 means the outcome was not saved'
+        );
+        System.assertNotEquals(
+            null,
+            outbox.Completed_Timestamp__c,
+            'The subscriber accepted the message, so the outbox should be marked delivered'
+        );
+        System.assert(
+            outbox.Log__c.length() <= LONGEST_BODY_LENGTH,
+            'The log should fit its field, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Log__c),
+            'The log should say it was shortened, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains(statusLine(200)),
+            'The log should keep its end, which names the method, the endpoint and the status, but is ' +
+            describe(outbox.Log__c)
+        );
+    }
+
+    /**
      * The client puts the whole response body in its failure message, so a subscriber that answers
      * a failure with a long body makes an error longer than its field.
      */
