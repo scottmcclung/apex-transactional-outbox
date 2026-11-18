@@ -56,3 +56,27 @@ That file recorded 52, 49 and 53 ms and 75,079 bytes at 100 messages for main at
 `Relay Queuable Skipped: Already enqueue from this context` printed in the `missing-subscription` and `missing-definition` runs, as it did before.
 
 The two oversized messages were also published by hand, with the commands in `benchmark/README.md`, and their outboxes read with SOQL. The result was the same as the scenario's, and the error outbox showed a next attempt 60 minutes after its attempt. Those records were deleted afterwards.
+
+## Note on the final commit, 554b502
+
+This note supersedes the code and heap lines above, which were measured at `8ba0ef5`.
+
+- **Code:** branch `5-5-shorten-oversized-text` at `554b502`. `main` at `cd22d63`. Both measured in one session in `outbox-dev`, with `main`'s three relay classes deployed over the branch for the `main` runs and the whole branch `force-app` deployed again afterwards.
+- **Logging:** the only trace flag still expired at 00:40:02 UTC when checked at 02:53 UTC. All figures were taken without a debug log.
+- **Case:** fixed cost. Run heap is 61 bytes higher on the branch at 1, 10 and 100 messages. The gap does not grow with the number of messages and is under 100 bytes.
+- **Cause:** not verified. The branch read 9,823 bytes at `8ba0ef5`, which gave a 29 byte gap. Main read the same figures as its earlier session this time, so the extra 32 bytes come from code committed after `8ba0ef5`. The likely source is the four static surrogate constants added to `TB_OutboxRelayContext`.
+
+| Messages | Code | Run CPU (ms) | Run heap (bytes) |
+|---|---|---|---|
+| 1 | main | 23 | 9,794 |
+| 1 | branch | 34 | 9,855 |
+| 10 | main | 21 | 15,824 |
+| 10 | branch | 32 | 15,885 |
+| 100 | main | 44, 50, 53, 57, 62; median 53 | 76,214 in every sample |
+| 100 | branch | 60, 61, 50, 51, 60; median 60 | 76,275 in every sample |
+
+The 1 and 10 message CPU figures are single samples. At 100 messages the median differs by 7 ms, and main's own samples span 18 ms, so the difference is inside the spread of either version.
+
+`RunLocalTests` on this code in `outbox-dev`: 189 run, 189 passed, 0 failed.
+
+Every `reproduce.js` scenario matched the Reproduce table above. `oversized-text` stored the error with its start and a shortened notice at its end. It stored the log with a shortened notice at its start and `OVERSIZED-END` at its end. The after-relay action printed one context.
