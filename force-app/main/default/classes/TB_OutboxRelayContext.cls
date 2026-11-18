@@ -104,15 +104,17 @@ public class TB_OutboxRelayContext {
      * and the retry wait, so text that is not shortened loses the outcome of the attempt.
      *
      * The error keeps its start, because the message comes before the stack trace. The log keeps its
-     * end, because it ends with what the subscriber answered. Each says it was shortened and how long
-     * it was. Text that fits is left as it is.
+     * end, the most recent lines logged. Each says it was shortened and how long it was. Text that
+     * fits is left as it is.
      *
-     * The length compared is the length of the text as written. The platform trims a line break from
-     * the end before it checks, so a log that would fit by that one character is still shortened.
+     * The length compared is the length of the text as written, line breaks included. In a scratch
+     * org, a log of 131,073 characters ending in a line break saved and was stored as 131,072, and
+     * 131,073 characters with no whitespace at the end failed. A log over the field length only by
+     * a line break at its end is still shortened here.
      */
     public void shortenTextToFitFields() {
-        // A field is assigned only when it is shortened. Assigning both on every attempt, even to the
-        // value they already held, added about 25 bytes of heap for every outbox a run holds.
+        // A field is assigned only when it is shortened. Assigning the log and the error, even to the
+        // values they already hold, costs about 25 bytes of heap for each outbox the run holds.
         if (outbox.Log__c != null && outbox.Log__c.length() > LOG_FIELD_LENGTH) {
             outbox.Log__c = keepEnd(outbox.Log__c, LOG_FIELD_LENGTH);
         }

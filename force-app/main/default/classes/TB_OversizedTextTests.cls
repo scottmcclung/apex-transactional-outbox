@@ -6,7 +6,7 @@
  * update, so a text that is not shortened first loses the outcome of the attempt.
  *
  * The error keeps its start, because the message comes before the stack trace. The log keeps its
- * end, because it ends with what the subscriber answered. Both say they were shortened.
+ * end, the most recent lines logged. Both say they were shortened.
  */
 @isTest
 public class TB_OversizedTextTests {
@@ -257,8 +257,9 @@ public class TB_OversizedTextTests {
 
     @isTest
     static void testWhenLogIsOneCharacterLongerThanItsFieldThenItIsShortenedAndDeliveryIsSaved() {
-        // The line break that ends the log is not counted here, because the platform drops it
-        // before it checks the length. Without it this log is one character more than the field holds.
+        // The line break that ends the log is not counted here. A log over the field length only by
+        // a line break at its end has been seen to save. Without it this log is one character more
+        // than the field holds.
         addLongTextSubscription(FIELD_LENGTH + 1 - LOG_LINE_PREFIX_LENGTH, null);
 
         TB_Subscription_Outbox__c outbox = relayOneMessage();
