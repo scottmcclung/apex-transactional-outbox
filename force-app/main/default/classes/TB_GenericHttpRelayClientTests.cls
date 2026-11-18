@@ -264,8 +264,7 @@ public class TB_GenericHttpRelayClientTests {
             outbox.Completed_Timestamp__c,
             'The subscriber accepted the message, so the outbox should be marked delivered'
         );
-        // The method and endpoint logged before the send are in the part dropped, so these come from
-        // the status line logged after it.
+        // The status line is logged after the body, so it is in the end the log keeps.
         System.assert(
             outbox.Log__c.contains(statusLine(200)),
             'The log should keep its end, which names the method, the endpoint and the status, but is ' +
@@ -309,6 +308,35 @@ public class TB_GenericHttpRelayClientTests {
         );
         System.assert(
             outbox.Log__c.contains(statusLine(200)),
+            'The log should keep its end, which names the method, the endpoint and the status, but is ' +
+            describe(outbox.Log__c)
+        );
+    }
+
+    /**
+     * A subscriber that refuses the longest message makes a log too long for its field. The status
+     * line is logged after the body, so it is in the end the log keeps.
+     */
+    @isTest
+    static void testWhenSubscriberRejectsBodyThatFillsTheLogThenLogKeepsTheStatusLine() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp('b'.repeat(LOG_FIELD_LENGTH), 500, SUBSCRIBER_ANSWER);
+
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The failed attempt should be counted. A count of 0 means the outcome was not saved'
+        );
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assert(
+            outbox.Log__c.length() <= LOG_FIELD_LENGTH,
+            'The log should fit its field, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Log__c),
+            'The log should say it was shortened, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains(statusLine(500)),
             'The log should keep its end, which names the method, the endpoint and the status, but is ' +
             describe(outbox.Log__c)
         );

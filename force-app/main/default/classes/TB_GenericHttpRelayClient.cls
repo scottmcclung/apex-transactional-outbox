@@ -79,7 +79,11 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
             : 'POST';
 
         ctx.log('Processing Record: ' + ctx.outbox.Id);
-        ctx.log(new List<String>{ method, uri, bodyStr });
+        ctx.log('Request body: ' + bodyStr);
+        // Logged after the body. A log too long for its field keeps its end, and a send that throws
+        // before any answer logs no status line, so with a long body this is the line that still
+        // says where the request went.
+        ctx.log('Sending ' + method + ' ' + uri);
         // replace with carrier
         HttpRequest req = new HttpRequest();
 
@@ -97,9 +101,9 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
         Http http = new Http();
         HTTPResponse res = http.send(req);
         ctx.setResult(new GenericRelayResult(res));
-        // Names the method and endpoint again, and is the last line of the attempt. A log too long for
-        // its field keeps its end, and with a long body or a long response the lines before this one
-        // are in the part dropped.
+        // Names the method and endpoint again with the status, and is the last line of the attempt. A
+        // log too long for its field keeps its end, and with a long response the lines before this
+        // one are in the part dropped.
         String statusLine = method + ' ' + uri + ' answered with status ' + res.getStatusCode();
         if (res.getStatusCode() > 300) {
             ctx.log(statusLine);
