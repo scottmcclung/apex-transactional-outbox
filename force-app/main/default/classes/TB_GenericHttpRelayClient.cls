@@ -48,8 +48,8 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
     // read inside one statement, so all five are counted as held at once. That is 11 copies. The
     // extra 4 KB covers the log's other lines.
     //
-    // What a send still holds when it returns is lower. In a test against a mock it was 4 copies on
-    // success, and 5 on failure once the run stored the error message.
+    // What a send still holds when it returns is lower. In a test against a mock it was 3 copies on
+    // success, and 4 on failure once the run stored the error message.
     private static final Integer SEND_HEAP_BYTES = 11 * LONGEST_BODY_BYTES + 4096;
 
     public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {

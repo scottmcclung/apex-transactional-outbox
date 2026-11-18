@@ -111,22 +111,22 @@ public class TB_OutboxRelayContext {
      * the end before it checks, so a log that would fit by that one character is still shortened.
      */
     public void shortenTextToFitFields() {
-        outbox.Log__c = keepEnd(outbox.Log__c, LOG_FIELD_LENGTH);
-        outbox.Last_Error_Message__c = keepStart(outbox.Last_Error_Message__c, ERROR_FIELD_LENGTH);
+        // A field is assigned only when it is shortened. Assigning both on every attempt, even to the
+        // value they already held, added about 25 bytes of heap for every outbox a run holds.
+        if (outbox.Log__c != null && outbox.Log__c.length() > LOG_FIELD_LENGTH) {
+            outbox.Log__c = keepEnd(outbox.Log__c, LOG_FIELD_LENGTH);
+        }
+        if (outbox.Last_Error_Message__c != null && outbox.Last_Error_Message__c.length() > ERROR_FIELD_LENGTH) {
+            outbox.Last_Error_Message__c = keepStart(outbox.Last_Error_Message__c, ERROR_FIELD_LENGTH);
+        }
     }
 
     private static String keepStart(String text, Integer fieldLength) {
-        if (text == null || text.length() <= fieldLength) {
-            return text;
-        }
         String notice = '\n[Shortened from ' + text.length() + ' characters to fit its field. The end was dropped.]';
         return text.left(fieldLength - notice.length()) + notice;
     }
 
     private static String keepEnd(String text, Integer fieldLength) {
-        if (text == null || text.length() <= fieldLength) {
-            return text;
-        }
         String notice = '[Shortened from ' + text.length() + ' characters to fit its field. The start was dropped.]\n';
         return notice + text.right(fieldLength - notice.length());
     }
