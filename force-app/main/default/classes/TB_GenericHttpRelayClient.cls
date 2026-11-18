@@ -41,16 +41,16 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
     // uses more, in proportion to its length.
     //
     // Each log line rebuilds the whole log, so the old and new log are held at once. The worst point
-    // is the last log line on success. Before it the send holds the log with the body twice (2), the
+    // is the last log line on success. Before it the send holds the log with the body once (1), the
     // response and the relay result's copy of its body (2), and the JSON body when the resolved
     // message is not a String (1). That line builds the response text through up to five strings (5)
-    // and a new log holding the body twice and the response once (3). Limits.getHeapSize() cannot be
-    // read inside one statement, so all five are counted as held at once. That is 13 copies. The
+    // and a new log holding the body and the response once each (2). Limits.getHeapSize() cannot be
+    // read inside one statement, so all five are counted as held at once. That is 11 copies. The
     // extra 4 KB covers the log's other lines.
     //
     // What a send still holds when it returns is lower. In a test against a mock it was 4 copies on
     // success, and 5 on failure once the run stored the error message.
-    private static final Integer SEND_HEAP_BYTES = 13 * LONGEST_BODY_BYTES + 4096;
+    private static final Integer SEND_HEAP_BYTES = 11 * LONGEST_BODY_BYTES + 4096;
 
     public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
         TB_SendCost cost = new TB_SendCost();
@@ -85,9 +85,6 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
                 req.setHeader(header, String.valueOf(headers.get(header)));
             }
         }
-
-
-        ctx.log('body: ' + bodyStr);
 
         req.setEndpoint(uri);
         req.setBody(bodyStr);

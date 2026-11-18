@@ -85,8 +85,50 @@ public class TB_OutboxRelayContext {
         this.relayResult = result;
     }
 
+    /**
+     * Adds one line to the log of this attempt. A log too long for its field keeps its end when the
+     * attempt's outcome is stored, as shortenTextToFitFields describes.
+     */
     public void log(Object trace) {
         outbox.Log__c += System.now() + ': ' + trace.toString() + '\n';
+    }
+
+    // Read from the fields, so the shortening follows the fields if either is ever made shorter.
+    private static final Integer LOG_FIELD_LENGTH = TB_Subscription_Outbox__c.Log__c.getDescribe().getLength();
+    private static final Integer ERROR_FIELD_LENGTH = TB_Subscription_Outbox__c.Last_Error_Message__c.getDescribe()
+        .getLength();
+
+    /**
+     * Shortens the log and the error so each fits its field. The platform rejects the whole outbox
+     * update when either is too long, and that update also carries the attempt count, the delivery
+     * and the retry wait, so text that is not shortened loses the outcome of the attempt.
+     *
+     * The error keeps its start, because the message comes before the stack trace. The log keeps its
+     * end, because it ends with what the subscriber answered. Each says it was shortened and how long
+     * it was. Text that fits is left as it is.
+     *
+     * The length compared is the length of the text as written. The platform trims a line break from
+     * the end before it checks, so a log that would fit by that one character is still shortened.
+     */
+    public void shortenTextToFitFields() {
+        outbox.Log__c = keepEnd(outbox.Log__c, LOG_FIELD_LENGTH);
+        outbox.Last_Error_Message__c = keepStart(outbox.Last_Error_Message__c, ERROR_FIELD_LENGTH);
+    }
+
+    private static String keepStart(String text, Integer fieldLength) {
+        if (text == null || text.length() <= fieldLength) {
+            return text;
+        }
+        String notice = '\n[Shortened from ' + text.length() + ' characters to fit its field. The end was dropped.]';
+        return text.left(fieldLength - notice.length()) + notice;
+    }
+
+    private static String keepEnd(String text, Integer fieldLength) {
+        if (text == null || text.length() <= fieldLength) {
+            return text;
+        }
+        String notice = '[Shortened from ' + text.length() + ' characters to fit its field. The start was dropped.]\n';
+        return notice + text.right(fieldLength - notice.length());
     }
 
     // will be called by OutboxRelay
