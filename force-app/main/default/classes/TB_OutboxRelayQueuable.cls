@@ -1000,8 +1000,14 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           );
         }
   
+        // The run's own save keeps the rows the platform accepts, so this tries only the rows it
+        // rejected, once more.
         save();
-  
+        // PLANNED: report each outcome that is still unsaved here through the subscription's log
+        // adapter. A row rejected both times keeps what it had before its attempt, so a delivery is
+        // not recorded, the next run sends the message again, and the attempt is never counted
+        // toward dead-lettering. Until then the debug log that save writes is the only record of it.
+
         try {
           TB_Subscription_Outbox__c[] activeOutboxItems = TB_OutboxRelayQueuable.chooseAttemptable(
             1,
