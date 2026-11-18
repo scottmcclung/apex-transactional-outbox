@@ -46,7 +46,8 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
     // message is not a String (1). That line builds the response text through up to five strings (5)
     // and a new log holding the body and the response once each (2). Limits.getHeapSize() cannot be
     // read inside one statement, so all five are counted as held at once. That is 11 copies. The
-    // extra 4 KB covers the log's other lines.
+    // extra 4 KB covers the log's other lines, held in the old and the new log at once. They name
+    // the endpoint twice, so it covers an endpoint of up to about 900 characters.
     //
     // What a send still holds when it returns is lower. In a test against a mock it was 3 copies on
     // success, and 4 on failure once the run stored the error message.
@@ -93,7 +94,9 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
         Http http = new Http();
         HTTPResponse res = http.send(req);
         ctx.setResult(new GenericRelayResult(res));
-        ctx.log('Status Code: ' + res.getStatusCode());
+        // Names the method and endpoint again. A log too long for its field keeps its end, and with a
+        // long body the line before the send, which also names them, is in the part dropped.
+        ctx.log(method + ' ' + uri + ' answered with status ' + res.getStatusCode());
         if (res.getStatusCode() > 300) {
             throw new HttpRelayException(
                 'Request Failed with status ' + res.getStatusCode() + '. Response Body: ' + res.getBody()
