@@ -361,5 +361,5 @@ However, these should be used sparingly and with caution:
 
 **It is recommended that your AfterRelayAction publishes an "Immediate Platform Event" to handle additional processing.**
 
-An action sees each outbox's `Log__c` and `Last_Error_Message__c` as they are stored. A log or error too long for its field has already been shortened. The error keeps its start, the log keeps its end, and each says it was shortened. `relayResult` is not shortened. For `TB_GenericHttpRelayClient` it holds the whole response body, on success and on failure.
+An action sees each outbox's `Log__c` and `Last_Error_Message__c` as they are stored. A log or error too long for its field has already been shortened. The error keeps its start, the log keeps its end, and each says it was shortened. `relayResult` is not shortened. For `TB_GenericHttpRelayClient` it holds the whole response body whenever the subscriber answered, on success and on failure. When the send throws before any answer, such as on a timeout, `relayResult` is null.
 
