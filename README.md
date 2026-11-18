@@ -150,7 +150,9 @@ A relay client must implement `costOfSend` as well as `send`:
 TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription);
 ```
 
-It returns the most that one call to `send` for that subscription will use. Set every field of `TB_SendCost`. Use 0 for anything a send does not use. A cost with a field left null is not a valid declaration, and null does not mean 0.
+It returns the most that one call to `send` for that subscription will use. The relay run asks for it before every attempt. From the run's second attempt on, it compares it with what the run has left, and passes over an outbox it has no room for. See "Relay Limits" below for what the run does with it.
+
+Set every field of `TB_SendCost`. Use 0 for anything a send does not use. A cost with a field left null is not a valid declaration, and null does not mean 0.
 
 | Field | What it counts |
 |---|---|
@@ -164,9 +166,17 @@ It returns the most that one call to `send` for that subscription will use. Set 
 | `cpuTimeMs` | CPU time, in milliseconds |
 | `heapBytes` | Heap, in bytes. This is the highest the send raises the heap above where it stood when the send began, at any point during the send, including what it still holds when it returns. |
 
-The relay run uses this to decide whether it has room for another attempt before it starts one. A run always starts its first attempt, and checks for room from the second attempt on. A run that could attempt nothing would be queued again in the same state. So the outboxes of a client whose declared cost can never fit in a run are still attempted, one per run, each as that run's first attempt. Outboxes of other clients that do fit can follow it in the same run.
+A declaration the run cannot use fails the attempt. That covers `costOfSend` throwing, returning null, or returning a cost with a field that is null or negative. The attempt is counted, nothing is sent, and `Last_Error_Message__c` names the relay client and, for a bad field, the field. The outbox then waits on its subscription's retry backoff like any failed attempt.
 
-`TB_GenericHttpRelayClient` states one callout lasting up to its 10 second timeout, and no queries, writes or event publishes.
+`TB_GenericHttpRelayClient` declares:
+
+| Field | Value | Where it comes from |
+|---|---|---|
+| `callouts` | 1 | One request per send |
+| `calloutTimeMs` | 10,000 | The timeout it sets on every request |
+| `queries`, `queryRows`, `dmlStatements`, `dmlRows`, `eventPublishes` | 0 | It does none of these |
+| `cpuTimeMs` | 100 | Measured sends of the longest body used 3 to 6 ms, with one first send at 63 ms |
+| `heapBytes` | 1,708,032 | 13 copies of the longest body the payload field holds (131,072 characters), plus 4 KB. An upper bound counted from the code, for a body and a response each no longer than 131,072 characters. A longer body or response uses more |
 
 **This is a breaking change.** `costOfSend` was added to `TB_IOutboxRelayClient`. A relay client written before this change no longer compiles until it adds the method. To upgrade, add `costOfSend` to each of your relay clients and return the cost of what its `send` does. Deploy your updated relay clients in the same deployment as this version, so the interface and every class that implements it change together.
 
@@ -243,19 +253,88 @@ This can be enabled by checking the `Message Subscription -> Isolate Relay` box.
 
 ### Relay Limits
 
-A relay run attempts at most `Relay Batch Size` outboxes, oldest first, and leaves the rest for the next run. When a run ends and an outbox that can go is left, the next run is queued at once.
+A relay run works inside the limits of one asynchronous Apex transaction. It takes a capped number of outboxes. From its second attempt on, it checks before each attempt that it has room for one more send, and it ends normally when it does not. Its finalizer then queues the next run if an outbox that can go is left. Some limits can still end a run part-way. They are listed at the end of this section.
 
-The value is set on the `TB Framework Settings` custom metadata record named `Default`. The record ships with a value of 100. The relay does not assume a value: if the record is missing, or the value is not from 1 to 1000, every relay run fails with an error that says so.
+#### Batch size
 
-A run starts no more sends that need a callout once it has no callouts left, so a batch size above 100 does not make a run fail when relay clients make one callout per send. Such a run still loads every outbox in its batch and passes their messages to the message resolvers before its first send, so the ones it passes over cost heap and resolver work for nothing.
+A run takes at most `Relay Batch Size` outboxes, in publish order, and leaves the rest for the next run. The value is set on the `TB Framework Settings` custom metadata record named `Default`. The record ships with 100. The relay does not assume a value. If the record is missing, or the value is not from 1 to 1,000, every relay run fails at its start with an error that says so.
 
-An outbox that is already held when the run starts does not count toward the batch size. An outbox that becomes held during the run, because an earlier message in its group failed, has already been chosen. It is not attempted and its place is not given to another outbox. A run reads up to 10 pages of due outboxes, each twice the batch size, while it looks for outboxes it can attempt.
+The run chooses its batch without payloads and without a lock. It reads due outboxes a page at a time, each page twice the batch size, for up to 10 pages. It skips an outbox that is held because an earlier message in its group is dead-lettered or waiting on its retry backoff. A held outbox does not count toward the batch size. The run then loads the chosen outboxes with their payloads, locked.
 
-Before each attempt after its first, the run compares the relay client's `costOfSend` with what it has left of each limit. An outbox it has no room for is left as it is, without being charged an attempt, and stays due for a later run. The first attempt is not checked, so every run that reaches an outbox it can send attempts at least one. If that one send needs more than the run has left, it can reach a limit, with the results described below.
+An outbox that becomes held during the run, because an earlier message in its group failed or was passed over, has already been chosen. It is not attempted, and its place is not given to another outbox.
 
-The platform does not report how much callout time a transaction has used, so the run counts time on the clock from just before it calls the message resolvers. Time spent in resolvers and in any other processing from then on counts against the 120 seconds, as well as time spent waiting on callouts.
+#### The room check
 
-A send or a message resolver can still reach a limit. When the platform's error can be caught, as it can for the 120 seconds of callout time, the attempt is abandoned. It is not counted, no error or wait is recorded against the outbox, and a TTL the relay client set during the attempt is put back. The outbox keeps its attempt time and whatever the attempt logged. The run starts nothing more, saves its outcomes, and the next run takes the outbox up. An abandoned attempt leaves no error on the outbox, and for now the only record of why it was abandoned is the debug log. An attempt that reaches the callout time limit the same way on every run is abandoned on every run and never charged, so it is never dead-lettered, and the outboxes behind it in each of those runs are not started. An operator sees `Last_Attempt__c` move forward while `Relay_Attempts__c` stays the same, no new `Last_Error_Message__c`, `Dead_Lettered__c` false, and a steady stream of relay jobs. A limit the platform does not let code catch ends the job. When that happens during a send, the run's finalizer saves the outcomes it already has, and the outbox whose attempt was cut off is left as it was. When it happens inside a message resolver, the job ends before the finalizer is attached, so the next run is not queued until a publish or the scheduled relay sweep starts one.
+Before every attempt, the run asks the relay client for `costOfSend` and checks that the declaration is usable. From the run's second attempt on, it also compares the declaration with what the run has left. It compares nine limits: callouts, callout time, queries, query rows, DML statements, DML rows, immediate event publishes, CPU time and heap. A send fits when it needs no more than what is left of every one of them.
+
+For eight of the limits, what is left comes from the `Limits` class at the moment of the check: the limit less what the transaction has used. The platform has no counter for callout time. The run counts time on the clock from just before it calls the message resolvers, against 120,000 ms. That time includes resolver work and all other processing as well as callouts, so it can only overstate the time callouts have taken.
+
+The heap limit is read from `Limits.getLimitHeapSize()`. The heap figures in this section come from one scratch org, where a queueable reported 25,000,000 bytes. Read `Limits.getLimitHeapSize()` in a queueable in your own org to see what it reports. Where a figure depends on the limit, the figure for an org that reports 12,000,000 bytes is given as well. Those figures are derived and were not measured.
+
+The run always starts its first attempt, without the room check. A run that could attempt nothing would leave every outbox as it was, and its finalizer would queue the next run in the same state, without end. An attempt counts as the first once its relay client is built and its cost is read and usable. An outbox failed before that, for missing configuration, a client that cannot be built or a declaration that cannot be used, leaves the first attempt still to come. At worst the first send goes past a limit, with the results described under "Abandoned attempts" and "What can still stop a run". The outboxes of a client whose declared cost never fits in a run are still attempted, at most one per run, and only as a run's first attempt.
+
+An outbox the run has no room for is passed over. It is not attempted, not charged an attempt and not saved, so it stays exactly as it was and stays due. For the rest of the run it holds the later messages in its group, the same as a failed send. The run goes on to the next outbox, because another client's send may still fit. A later run takes the passed-over outbox up.
+
+#### A batch larger than the callout limit
+
+Once a run has made 100 callouts, it passes over every remaining outbox whose client declares a callout. So a batch size above 100 does not make a run of HTTP outboxes fail. But before its first send the run has already loaded every outbox in its batch, with its payload, and passed the message of every outbox it planned to attempt to the message resolvers. The outboxes it passes over cost that heap and resolver work for nothing, and the next run loads them again.
+
+#### Abandoned attempts
+
+A send can still reach a limit when it is the run's first attempt or when its client uses more than it declared. When the run can catch the platform's error, it abandons the attempt. Total callout time is the only limit it handles this way. The callout that goes past 120 seconds throws a `System.CalloutException` whose message starts with `Exceeded maximum time allotted for callout`, and the run recognises the limit by that type and message together. A message resolver that reaches this limit has the exception kept as its resolved message, and the first attempt that uses it is abandoned the same way.
+
+The run recognises the limit only in the `System.CalloutException` the platform throws. A relay client that catches that exception and throws its own has the attempt counted as failed. If that was the outbox's last attempt, the outbox is dead-lettered.
+
+An abandoned attempt is not counted. No error is recorded, no retry wait is set, not even one the client asked for, and a TTL the client set during the attempt is put back. An outbox on its last attempt is therefore not dead-lettered. The outbox keeps the attempt time in `Last_Attempt__c`, and `Log__c` holds what the attempt logged. The run starts nothing more, saves its outcomes, and its finalizer queues the next run, which takes the outbox up again. If the request had already reached the subscriber, the next run sends it again.
+
+The reason is written only to the debug log, as `Relay attempt abandoned at a run limit for outbox <Id>: <message>`. It is there only when a debug log is being recorded for the user the relay runs as.
+
+An attempt that reaches the callout time limit the same way on every run is abandoned on every run and never charged. It is never dead-lettered, and the outboxes after it in each of those runs are not started. To an operator it looks like this: `Last_Attempt__c` moves forward while `Relay_Attempts__c` stays the same, `Last_Error_Message__c` does not change, `Next_Attempt_Timestamp__c` stays empty, `Dead_Lettered__c` stays false, and relay jobs keep completing one after another without errors.
+
+#### What can still stop a run or slow it
+
+**The load.** The run loads the payloads of its whole batch in one query, before it attaches its finalizer. `Message__c` holds up to 131,072 characters. The load also reads `Last_Error_Message__c`, which holds as many.
+
+Megabytes here are millions of bytes of heap. In the measurements below, a full long text field of 131,072 characters took about 132,000 bytes of heap, and the figures for full fields use that rate. A full last error is taken to cost the same, which was not measured. Derived figures assume one byte of heap per character. Only payloads of single-byte characters were measured.
+
+Measured in one scratch org, on code that also loaded an empty `Log__c`, with full payloads and no last errors (GitHub #34 and `benchmark/results/2026-11-16-baseline.md`): a run with 200 payloads, about 26.4 MB, got past the load. A run with 400, about 53 MB, failed in the load query with `Query of LOB fields caused heap usage to exceed limit.` Sizes between those two were not measured. Both sizes come from that one org.
+
+Derived from those figures:
+
+- A batch whose payloads and last errors together come to more than about 26.4 MB may end the run at the load. One of about 53 MB did.
+- At the shipped batch size of 100, full payloads come to about 13.2 MB. With a full last error on every outbox as well, the load is about 26.4 MB. What follows from that is described below.
+- At the largest batch size, 1,000, payloads and last errors that together average more than about 26 KB per outbox go past the largest load measured to pass. An average of about 53 KB reaches the size that failed.
+- Only full payloads were measured. The per-outbox figures assume the failure depends on the total size of long text in the load and not on the number of rows.
+
+When a run ends at the load, nothing is attempted, nothing is saved, and no next run is queued. The next run starts only when a message is published or the relay sweep runs. It chooses the same oldest outboxes and fails the same way. Delivery stops for every outbox until the batch holds less, through a lower batch size or fewer of those outboxes being due.
+
+A load over the heap limit does not always fail at once. In the same measurements, the 200-payload run sent every outbox and then failed with `Apex heap size too large: 26358965`, and its finalizer saved every outcome. That was before the room check. How a run behaves past the heap limit now has not been measured.
+
+A batch of 100 with a full payload and a full last error on every outbox loads about 26.4 MB, derived. That is the size of the 200-payload run, which got past the load. It is over 25,000,000 bytes before any send, so the room check finds no heap left, and the run sends only its first outbox. That send may end the job with a heap error. The 200-payload run ended with one, after its sends. A send that ends the job this way leads to what is described under "A limit the platform does not let code catch, during a send".
+
+**Little heap left after the load.** The room check counts the heap the load used. When the load leaves less heap than a client declares, the run sends only its first outbox and passes over the rest. When that first send completes, such a backlog drains one outbox per run. When it ends the job instead, the backlog does not drain, as described under "A limit the platform does not let code catch, during a send".
+
+`TB_GenericHttpRelayClient` declares 1,708,032 bytes. Its sends stop after the first once the heap in use passes 25,000,000 − 1,708,032 = 23,291,968 bytes, which is about 176 full payloads. In an org that reports 12,000,000, they stop after the first at 12,000,000 − 1,708,032 = 10,291,968 bytes, about 78 full payloads. There a batch of 100 full payloads, about 13.2 MB, leaves no heap after the load. If the load gets through, the run sends one outbox at most. The figures for 12,000,000 are derived.
+
+Each send also raises the heap until the run saves. Measured against a mock in a test, a successful HTTP send of the longest body keeps about 4 copies of it, about 524,000 bytes. A failed send keeps about 5, about 655,000 bytes, once the run has stored the error. Derived from those, a batch of 100 full payloads in an org that reports 25,000,000 has room for about 20 HTTP sends when every send succeeds, and about 16 when every send fails.
+
+**A limit inside a message resolver.** Message resolvers run before the finalizer is attached. A limit the platform does not let code catch, such as CPU time, heap or queries, ends the job there. Nothing is saved and no next run is queued. The next run starts when a message is published or the relay sweep runs. It chooses the same outboxes, plans the same attempts and passes the same messages to the same resolvers, so a resolver that does the same work reaches the same limit again. This repeats until the run's batch is smaller or the resolver uses less.
+
+**A limit the platform does not let code catch, during a send.** The job ends. The finalizer saves the outcomes the run already has and queues the next run. The outbox whose attempt was cut off is not handed to the finalizer. It is left exactly as it was, so the attempt is not counted, and it stays due.
+
+When the same send reaches the limit on every run, this repeats. The next run takes the outbox up again, as its first attempt when nothing due comes before it, and a first attempt has no room check. The outbox is never charged an attempt and never dead-lettered, and each run ends as a failed job. The platform's documented rule, as cited in GitHub #34, is that a finalizer can queue a queueable that failed with an unhandled exception again only five times in a row. After that the chain stops until a message is published or the relay sweep runs, and the next run meets the same send.
+
+To an operator it looks like this: relay jobs that end as failed, and an outbox whose `Relay_Attempts__c` does not move. Its `Last_Attempt__c`, `Log__c` and `Last_Error_Message__c` do not change either, because nothing about it is saved. The common cause is a run's unchecked first send when the load has left too little heap, as under "Little heap left after the load".
+
+**A client that declares too little.** The room check knows only what the client declares. A client that uses more can still take the run past a limit. Callout time ends in an abandoned attempt, and any other limit ends the job as described above.
+
+**Nothing is kept back for the run's own work after the last send.** The run saves its outcomes in one DML statement at the end, and the room check reserves nothing for it. If that save goes past a limit the platform does not let code catch, the finalizer saves the outcomes in its own transaction. After-relay actions also run in the finalizer's transaction.
+
+#### What the check costs
+
+Before every attempt the run gets the relay client, which is built once per subscription per run, calls `costOfSend` and checks the nine fields. From the second attempt on, it also reads nine limits and the clock and compares them with the declaration. At 100 messages the check added about 0.2 ms of CPU per attempt, measured with debug logging on, which inflates CPU figures (`benchmark/results/2026-11-17-budget-check.md`).
+
+Part of that grows with the size of the run. `Limits.getHeapSize()` costs CPU in proportion to the number of objects on the heap. Measured without debug logging, that one reading took about 0.05 to 0.1 ms per attempt in a run of 100 outboxes, and about 0.45 to 0.65 ms in a run of 1,000 (`benchmark/results/2026-11-18-cpu-growth.md`). Through a test client that only writes one short log line, a run of 1,000 outboxes used 774 ms of CPU up to its last send, about 1.3% of the 60,000 ms limit. That figure leaves out the save and the finalizer. Message resolvers or relay clients that keep many objects make each reading cost more. That has not been measured.
 
 ### Record Cleanup
 
