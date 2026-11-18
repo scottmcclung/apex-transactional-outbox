@@ -392,6 +392,83 @@ public class TB_TransactionOutboxTestUtils {
         }
     }
 
+    // The outboxes UnsaveableOutboxClient has sent for, each the record its relay run holds and saves.
+    @testVisible
+    static List<TB_Subscription_Outbox__c> unsaveableOutboxes = new List<TB_Subscription_Outbox__c>();
+
+    /**
+     * Sends like TestClient, and leaves the outbox the run holds with an application name one
+     * character too long for its field. The platform rejects the update of that row for as long as
+     * the name stays that way, and saves the other rows of the same update.
+     *
+     * The relay neither reads nor writes the application name, so nothing else about the run
+     * changes. Settings with "throwError" set to true make the send fail as well.
+     */
+    public class UnsaveableOutboxClient implements TB_IOutboxRelayClient {
+        public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
+            return inMemorySendCost();
+        }
+
+        public void send(TB_OutboxRelayContext ctx) {
+            sentMessages.add(ctx.resolvedMessage);
+            clearRunGuardIfAsked();
+            Integer nameLength = TB_Subscription_Outbox__c.Application__c.getDescribe().getLength();
+            ctx.outbox.Application__c = 'x'.repeat(nameLength + 1);
+            unsaveableOutboxes.add(ctx.outbox);
+            if (ctx.subscriptionConfig.get('throwError') == true) {
+                throw new TestException('Test Error');
+            }
+        }
+    }
+
+    // Every outbox as it was stored when RelayRunThenMend's relay run had ended and its finalizer
+    // had not started.
+    @testVisible
+    static Map<Id, TB_Subscription_Outbox__c> storedAfterRunSave;
+
+    // What RelayRunThenMend writes to the log of each outbox the run's own save stored.
+    public static final String LOG_WRITTEN_BETWEEN_SAVES = 'Written after the run saved this outbox';
+
+    /**
+     * One relay run, followed by what a test needs done before that run's finalizer starts.
+     *
+     * A relay run saves its outcomes as its last step and its finalizer saves again. In a test both
+     * happen inside Test.stopTest(), so the test's own code cannot come between them. A finalizer
+     * belongs to the job it was attached in, whichever class attached it. Running the relay run
+     * inside this job therefore puts the rest of this job between the two saves.
+     *
+     * Once the run has ended this records what is stored, and then does two things:
+     * - It writes a line to the log of each outbox the run's save stored. A finalizer that saved
+     *   such an outbox again would put the run's copy of the log back over that line. The record's
+     *   own modified time is kept to the second, so it cannot show a second write.
+     * - It puts the stored application name back on each outbox UnsaveableOutboxClient changed, so
+     *   the platform accepts that row the next time it is saved.
+     */
+    public class RelayRunThenMend implements Queueable {
+        public void execute(QueueableContext ctx) {
+            new TB_OutboxRelayQueuable().execute(ctx);
+
+            storedAfterRunSave = new Map<Id, TB_Subscription_Outbox__c>(
+                [
+                    SELECT Application__c, Relay_Attempts__c, Last_Attempt__c, Completed_Timestamp__c
+                    FROM TB_Subscription_Outbox__c
+                ]
+            );
+
+            List<TB_Subscription_Outbox__c> savedByRun = new List<TB_Subscription_Outbox__c>();
+            for (TB_Subscription_Outbox__c stored : storedAfterRunSave.values()) {
+                if (stored.Relay_Attempts__c > 0) {
+                    savedByRun.add(new TB_Subscription_Outbox__c(Id = stored.Id, Log__c = LOG_WRITTEN_BETWEEN_SAVES));
+                }
+            }
+            update savedByRun;
+
+            for (TB_Subscription_Outbox__c outbox : unsaveableOutboxes) {
+                outbox.Application__c = storedAfterRunSave.get(outbox.Id).Application__c;
+            }
+        }
+    }
+
     /** A resolver whose own callouts use up the callout time of the run. */
     public class CalloutTimeLimitResolver implements TB_IOutboxMessageResolver {
         public Map<Id, Object> resolveMessages(TB_Outbox_Message__c[] messages) {
