@@ -79,8 +79,20 @@ OUTBOX_ORG=outbox-dev node reproduce.js malformed-config
 | `action-called-with-null` | An after-relay action is called for a subscription that had no attempt. |
 | `cleanup` | Cleanup removes a delivered outbox whose TTL has passed, keeps one whose TTL is ahead, and runs without an exception. |
 | `blank-max-attempts` | An outbox with no max attempts is dead-lettered at once. |
+| `oversized-text` | An error and a log each longer than their fields are shortened and the outcome is saved. The failed attempt is counted once, and its error keeps its start. The delivery is saved and not sent again, and its log keeps its end. Both say they were shortened. An ordinary after-relay action still gets its subscription's attempt. |
 
 Each scenario puts the faulty item first and a healthy message behind it, so the effect on other messages is visible.
+
+`oversized-text` uses `ReproOversizedTextClient`. It writes text of the length its subscription's `Config__c` gives. `repro_oversized_error_sub` fails with an error of 136,072 characters, and `repro_oversized_log_sub` logs a line of 136,072 characters and succeeds. Both fields hold 131,072. Each text starts with `OVERSIZED-START` and ends with `OVERSIZED-END`, so the marker still present shows which end was kept. The error subscription waits 60 minutes after a failure, so its outbox stays at one attempt while the scenario watches. The scenario prints the length and both ends of each stored error and log.
+
+To try it by hand, publish one message as anonymous Apex and read its outbox:
+
+```sh
+echo "insert new TB_Outbox_Message__c(Type__c = 'repro_oversized_log', Message__c = 'by hand');" | sf apex run --target-org outbox-dev
+sf data query --target-org outbox-dev --query "SELECT Subscription__c, Relay_Attempts__c, Completed_Timestamp__c, Last_Error_Message__c, Log__c FROM TB_Subscription_Outbox__c WHERE Subscription__c LIKE 'repro_oversized%'"
+```
+
+Use `repro_oversized_error` for the error. Delete those messages afterwards, or run any scenario, which deletes every outbox message in the org.
 
 ## Reading the numbers
 

@@ -63,6 +63,27 @@ function printOutboxes() {
     }
 }
 
+// The length of each stored error and log, and both its ends, so a person can see which end was kept.
+function printTextEnds() {
+    const outboxes = org.query(
+        "SELECT Subscription__c, Last_Error_Message__c, Log__c FROM TB_Subscription_Outbox__c WHERE Subscription__c LIKE 'repro_oversized%' ORDER BY Subscription__c"
+    );
+    console.log("stored text, with line breaks shown as \\n:");
+    for (const outbox of outboxes) {
+        for (const field of ["Last_Error_Message__c", "Log__c"]) {
+            const text = outbox[field];
+            if (!text) {
+                continue;
+            }
+            const shown = (part) => part.replace(/\n/g, "\\n");
+            console.log(
+                `  ${outbox.Subscription__c} ${field}: ${text.length} characters, ` +
+                    `from [${shown(text.slice(0, 100))}] to [${shown(text.slice(-110))}]`
+            );
+        }
+    }
+}
+
 function printActionRecords() {
     const records = org.query("SELECT Name FROM Account WHERE Name LIKE 'ReproAction%' ORDER BY CreatedDate, Name");
     if (records.length > 0) {
@@ -97,6 +118,9 @@ if (!DEBUG_ONLY.includes(scenario)) {
     console.log("relay job count, sampled every 8 seconds: " + jobCounts.join(", "));
     console.log("relay jobs: " + JSON.stringify(org.summariseJobs(org.relayJobsSince(marker))));
     printOutboxes();
+    if (scenario === "oversized-text") {
+        printTextEnds();
+    }
     printActionRecords();
 }
 
