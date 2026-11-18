@@ -358,6 +358,7 @@ public class TB_TransactionOutboxTestUtils {
      * "logLength" is the length of the text passed to the log, which then adds its own timestamp.
      * "errorLength" is the length of the whole error, message and stack trace together. A missing
      * setting leaves that part out, so settings with no "errorLength" make the send succeed.
+     * "abandonAfterLog" set to 1 makes the send run out of callout time once it has logged.
      */
     public class LongTextClient implements TB_IOutboxRelayClient {
         public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
@@ -374,6 +375,9 @@ public class TB_TransactionOutboxTestUtils {
             if (logLength != null) {
                 longTextClientLogged = longText(logLength);
                 ctx.log(longTextClientLogged);
+            }
+            if ((Integer) ctx.subscriptionConfig.get('abandonAfterLog') == 1) {
+                throw new CalloutException(CALLOUT_TIME_LIMIT_ERROR);
             }
             Integer errorLength = (Integer) ctx.subscriptionConfig.get('errorLength');
             if (errorLength != null) {

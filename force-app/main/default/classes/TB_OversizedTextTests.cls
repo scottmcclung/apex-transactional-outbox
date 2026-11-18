@@ -293,6 +293,27 @@ public class TB_OversizedTextTests {
         );
     }
 
+    /**
+     * An abandoned attempt is saved down a different path from a delivery or a failure: it is not
+     * counted and records no error, but its attempt time and its log are kept.
+     */
+    @isTest
+    static void testWhenAbandonedAttemptLoggedMoreThanItsFieldThenItsLogIsShortenedAndSaved() {
+        addLongTextSubscription(WELL_OVER_FIELD_LENGTH, null).Config__c = JSON.serialize(
+            new Map<String, Integer>{ 'logLength' => WELL_OVER_FIELD_LENGTH, 'abandonAfterLog' => 1 }
+        );
+
+        TB_Subscription_Outbox__c outbox = relayOneMessage();
+
+        System.assertEquals(0, outbox.Relay_Attempts__c, 'An attempt that hit a run limit should not be counted');
+        System.assertNotEquals(
+            null,
+            outbox.Last_Attempt__c,
+            'The attempt time should be saved. None means the outcome of the attempt was not saved'
+        );
+        assertLogKeepsItsEndAndSaysItWasShortened(outbox.Log__c);
+    }
+
     @isTest
     static void testWhenLogAndErrorAreBothLongerThanTheirFieldsThenFailedAttemptIsSavedWithBothShortened() {
         addLongTextSubscription(WELL_OVER_FIELD_LENGTH, WELL_OVER_FIELD_LENGTH);
