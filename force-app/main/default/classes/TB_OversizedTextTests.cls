@@ -140,8 +140,9 @@ public class TB_OversizedTextTests {
             stored.length() <= FIELD_LENGTH,
             'The shortened log should fit its field, notice included, but is ' + stored.length() + ' characters'
         );
-        // The platform drops a line break at the very end of a text when it stores it, so the
-        // stored log ends with the last characters that were logged.
+        // Every logged line ends with a line break. In this org, a log whose last character is a line
+        // break was stored without it, so the stored log ends with the last characters the client
+        // logged.
         System.assert(
             stored.endsWith(
                 logged.right(FIELD_LENGTH - TB_TransactionOutboxTestUtils.SHORTENED_NOTICE_ALLOWANCE)
