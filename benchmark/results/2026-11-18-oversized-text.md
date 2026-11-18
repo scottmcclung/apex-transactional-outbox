@@ -63,7 +63,7 @@ This note supersedes the code and heap lines above, which were measured at `8ba0
 
 - **Code:** branch `5-5-shorten-oversized-text` at `554b502`. `main` at `cd22d63`. Both measured in one session in `outbox-dev`, with `main`'s three relay classes deployed over the branch for the `main` runs and the whole branch `force-app` deployed again afterwards.
 - **Logging:** the only trace flag still expired at 00:40:02 UTC when checked at 02:53 UTC. All figures were taken without a debug log.
-- **Case:** fixed cost. Run heap is 61 bytes higher on the branch at 1, 10 and 100 messages. The gap does not grow with the number of messages and is under 100 bytes.
+- **Heap:** run heap is 61 bytes higher on the branch at 1, 10 and 100 messages. The gap is the same at every size and does not grow with the number of messages.
 - **Cause:** not verified. The branch read 9,823 bytes at `8ba0ef5`, which gave a 29 byte gap. Main read the same figures as its earlier session this time, so the extra 32 bytes come from code committed after `8ba0ef5`. The likely source is the four static surrogate constants added to `TB_OutboxRelayContext`.
 
 | Messages | Code | Run CPU (ms) | Run heap (bytes) |
@@ -75,7 +75,7 @@ This note supersedes the code and heap lines above, which were measured at `8ba0
 | 100 | main | 44, 50, 53, 57, 62; median 53 | 76,214 in every sample |
 | 100 | branch | 60, 61, 50, 51, 60; median 60 | 76,275 in every sample |
 
-The 1 and 10 message CPU figures are single samples. At 100 messages the median differs by 7 ms, and main's own samples span 18 ms, so the difference is inside the spread of either version.
+The branch read higher run CPU than main at every size in this session. The 1 and 10 message figures are single samples. At 100 messages the medians are 60 and 53 ms over five samples each, and main's own samples span 18 ms. An earlier run of the same code on the same day read 21, 23 and 50 ms at 1, 10 and 100 messages. The order of the samples is not recorded, so whether main and the branch were alternated or run in blocks is not known. Whether the first sample after each deploy was kept is not recorded either. A small fixed CPU cost per run is therefore not ruled out.
 
 `RunLocalTests` on this code in `outbox-dev`: 189 run, 189 passed, 0 failed.
 
