@@ -302,4 +302,77 @@ public class TB_OversizedTextTests {
         assertErrorKeepsItsStartAndSaysItWasShortened(outbox.Last_Error_Message__c);
         assertLogKeepsItsEndAndSaysItWasShortened(outbox.Log__c);
     }
+
+    // One character outside the Basic Multilingual Plane, written as two 16-bit units: a high
+    // surrogate then a low one. Strings are measured and cut in these units.
+    static final String TWO_UNIT_CHARACTER = String.fromCharArray(new List<Integer>{ 55357, 56832 });
+
+    static Boolean isHighSurrogate(Integer unit) {
+        return unit >= 55296 && unit <= 56319;
+    }
+
+    static Boolean isLowSurrogate(Integer unit) {
+        return unit >= 56320 && unit <= 57343;
+    }
+
+    /**
+     * Two texts of two-unit characters. In the second, one single-unit character at each end moves
+     * every two-unit character by one unit, counted from either end. Wherever a cut falls, counted
+     * from the start or from the end, one of the two puts a two-unit character across it, so the
+     * test does not depend on how long the notice is.
+     */
+    static List<String> textsWithTwoUnitCharactersOnEveryPossibleCut() {
+        String characters = TWO_UNIT_CHARACTER.repeat(WELL_OVER_FIELD_LENGTH / 2);
+        return new List<String>{ characters, 'x' + characters + 'x' };
+    }
+
+    @isTest
+    static void testWhenErrorIsShortenedAcrossATwoUnitCharacterThenNoHalfOfItIsKept() {
+        for (String thrown : textsWithTwoUnitCharactersOnEveryPossibleCut()) {
+            TB_OutboxRelayContext ctx = new TB_OutboxRelayContext(new TB_Subscription_Outbox__c(), null, null);
+            ctx.outbox.Last_Error_Message__c = thrown;
+
+            ctx.shortenTextToFitFields();
+
+            String stored = ctx.outbox.Last_Error_Message__c;
+            System.assert(stored.length() <= FIELD_LENGTH, 'The shortened error should fit its field');
+            System.assert(
+                TB_TransactionOutboxTestUtils.saysItWasShortened(stored),
+                'The error should say it was shortened'
+            );
+            // The text has no line breaks, so the first one starts the notice after the kept start.
+            Integer noticeStart = stored.indexOf('\n');
+            System.assert(noticeStart > 0, 'The error should keep its start ahead of the notice');
+            System.assert(stored.startsWith(thrown.left(noticeStart)), 'The error should keep its start');
+            System.assert(
+                !isHighSurrogate(stored.charAt(noticeStart - 1)),
+                'The kept start should not end with the first half of a two-unit character'
+            );
+        }
+    }
+
+    @isTest
+    static void testWhenLogIsShortenedAcrossATwoUnitCharacterThenNoHalfOfItIsKept() {
+        for (String logged : textsWithTwoUnitCharactersOnEveryPossibleCut()) {
+            TB_OutboxRelayContext ctx = new TB_OutboxRelayContext(new TB_Subscription_Outbox__c(), null, null);
+            ctx.outbox.Log__c = logged;
+
+            ctx.shortenTextToFitFields();
+
+            String stored = ctx.outbox.Log__c;
+            System.assert(stored.length() <= FIELD_LENGTH, 'The shortened log should fit its field');
+            System.assert(
+                TB_TransactionOutboxTestUtils.saysItWasShortened(stored),
+                'The log should say it was shortened'
+            );
+            // The text has no line breaks, so the first one ends the notice before the kept end.
+            Integer keptStart = stored.indexOf('\n') + 1;
+            System.assert(keptStart > 0 && keptStart < stored.length(), 'The log should keep its end after the notice');
+            System.assert(logged.endsWith(stored.substring(keptStart)), 'The log should keep its end');
+            System.assert(
+                !isLowSurrogate(stored.charAt(keptStart)),
+                'The kept end should not start with the second half of a two-unit character'
+            );
+        }
+    }
 }
