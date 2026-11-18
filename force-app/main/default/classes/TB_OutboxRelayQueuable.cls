@@ -937,7 +937,17 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
         results = new Map<Id, TB_OutboxRelayContext>();
       }
   
+      /**
+       * Takes the outcome of one attempt for the save. Every way an attempt ends comes through here
+       * once nothing more will be written to it, so text written to the outbox in any way, the
+       * client's included, is shortened before it is held for the rest of the run and saved.
+       *
+       * Everything that reads the context after this sees the shortened log and error, after-relay
+       * actions included, which is the text as it is stored. Shortening here bounds the heap each
+       * held outbox costs for the rest of the run. The context's relayResult is not shortened.
+       */
       public void addResult(TB_OutboxRelayContext ctx) {
+        ctx.shortenTextToFitFields();
         results.put(ctx.outbox.id, ctx);
       }
   

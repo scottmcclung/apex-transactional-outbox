@@ -166,6 +166,8 @@ Set every field of `TB_SendCost`. Use 0 for anything a send does not use. A cost
 | `cpuTimeMs` | CPU time, in milliseconds |
 | `heapBytes` | Heap, in bytes. This is the highest the send raises the heap above where it stood when the send began, at any point during the send, including what it still holds when it returns. |
 
+Declare at least 262,144 bytes more than the send still holds when it returns, because the run then shortens a log or error longer than its 131,072-character field and briefly holds up to two field lengths on top of the original text, as counted from the code.
+
 A declaration the run cannot use fails the attempt. That covers `costOfSend` throwing, returning null, or returning a cost with a field that is null or negative. The attempt is counted, nothing is sent, and `Last_Error_Message__c` names the relay client and, for a bad field, the field. The outbox then waits on its subscription's retry backoff like any failed attempt.
 
 `TB_GenericHttpRelayClient` declares:
@@ -176,7 +178,7 @@ A declaration the run cannot use fails the attempt. That covers `costOfSend` thr
 | `calloutTimeMs` | 10,000 | The timeout it sets on every request |
 | `queries`, `queryRows`, `dmlStatements`, `dmlRows`, `eventPublishes` | 0 | It does none of these |
 | `cpuTimeMs` | 100 | Measured sends of the longest body used 3 to 6 ms, with one first send at 63 ms |
-| `heapBytes` | 1,708,032 | 13 copies of the longest body the payload field holds (131,072 characters), plus 4 KB. An upper bound counted from the code, for a body and a response each no longer than 131,072 characters. A longer body or response uses more |
+| `heapBytes` | 1,445,888 | 11 copies of the longest body the payload field holds (131,072 characters), plus 4 KB. An upper bound counted from the code, for a body and a response each no longer than 131,072 characters. A longer body or response uses more |
 
 **This is a breaking change.** `costOfSend` was added to `TB_IOutboxRelayClient`. A relay client written before this change no longer compiles until it adds the method. To upgrade, add `costOfSend` to each of your relay clients and return the cost of what its `send` does. Deploy your updated relay clients in the same deployment as this version, so the interface and every class that implements it change together.
 
@@ -314,9 +316,9 @@ A batch of 100 with a full payload and a full last error on every outbox loads a
 
 **Little heap left after the load.** The room check counts the heap the load used. When the load leaves less heap than a client declares, the run sends only its first outbox and passes over the rest. When that first send completes, such a backlog drains one outbox per run. When it ends the job instead, the backlog does not drain, as described under "A limit the platform does not let code catch, during a send".
 
-`TB_GenericHttpRelayClient` declares 1,708,032 bytes. Its sends stop after the first once the heap in use passes 25,000,000 − 1,708,032 = 23,291,968 bytes, which is about 176 full payloads. In an org that reports 12,000,000, they stop after the first at 12,000,000 − 1,708,032 = 10,291,968 bytes, about 78 full payloads. There a batch of 100 full payloads, about 13.2 MB, leaves no heap after the load. If the load gets through, the run sends one outbox at most. The figures for 12,000,000 are derived.
+`TB_GenericHttpRelayClient` declares 1,445,888 bytes. Its sends stop after the first once the heap in use passes 25,000,000 − 1,445,888 = 23,554,112 bytes, which is about 178 full payloads. In an org that reports 12,000,000, they stop after the first at 12,000,000 − 1,445,888 = 10,554,112 bytes, about 80 full payloads. There a batch of 100 full payloads, about 13.2 MB, leaves no heap after the load. If the load gets through, the run sends one outbox at most. The figures for 12,000,000 are derived.
 
-Each send also raises the heap until the run saves. Measured against a mock in a test, a successful HTTP send of the longest body keeps about 4 copies of it, about 524,000 bytes. A failed send keeps about 5, about 655,000 bytes, once the run has stored the error. Derived from those, a batch of 100 full payloads in an org that reports 25,000,000 has room for about 20 HTTP sends when every send succeeds, and about 16 when every send fails.
+Each send also raises the heap until the run saves. Measured against a mock in a test, with a response as long as the body, a successful HTTP send of the longest body keeps about 3 copies of it, 393,509 bytes. Once the run shortens its log to fit the field, it keeps about 2, 262,198 bytes. A failed send keeps about 4, 525,651 bytes once the run has stored the error, and shortening leaves that about the same. Derived from those, a batch of 100 full payloads in an org that reports 25,000,000 has room for about 40 HTTP sends when every send succeeds, and about 20 when every send fails.
 
 **A limit inside a message resolver.** Message resolvers run before the finalizer is attached. A limit the platform does not let code catch, such as CPU time, heap or queries, ends the job there. Nothing is saved and no next run is queued. The next run starts when a message is published or the relay sweep runs. It chooses the same outboxes, plans the same attempts and passes the same messages to the same resolvers, so a resolver that does the same work reaches the same limit again. This repeats until the run's batch is smaller or the resolver uses less.
 
@@ -358,4 +360,6 @@ However, these should be used sparingly and with caution:
 - Make sure to always check limits for queries, DML & do not make additional callouts. If an action triggers an "uncatchable exception", it could cause the message results to be lost in some cases and may halt the chaining of the relay job.
 
 **It is recommended that your AfterRelayAction publishes an "Immediate Platform Event" to handle additional processing.**
+
+An action sees each outbox's `Log__c` and `Last_Error_Message__c` as they are stored. A log or error too long for its field has already been shortened. The error keeps its start, the log keeps its end, and each says it was shortened. `relayResult` is not shortened. For `TB_GenericHttpRelayClient` it holds the whole response body whenever the subscriber answered, on success and on failure. When the send throws before any answer, such as on a timeout, `relayResult` is null.
 

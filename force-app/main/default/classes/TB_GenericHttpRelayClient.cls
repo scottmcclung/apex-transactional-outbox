@@ -41,16 +41,20 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
     // uses more, in proportion to its length.
     //
     // Each log line rebuilds the whole log, so the old and new log are held at once. The worst point
-    // is the last log line on success. Before it the send holds the log with the body twice (2), the
-    // response and the relay result's copy of its body (2), and the JSON body when the resolved
-    // message is not a String (1). That line builds the response text through up to five strings (5)
-    // and a new log holding the body twice and the response once (3). Limits.getHeapSize() cannot be
-    // read inside one statement, so all five are counted as held at once. That is 13 copies. The
-    // extra 4 KB covers the log's other lines.
+    // is the line that logs the response on success. Before it the send holds the log with the body
+    // once (1), the response and the relay result's copy of its body (2), and the JSON body when the
+    // resolved message is not a String (1). That line builds the response text through up to five
+    // strings (5) and a new log holding the body and the response once each (2). Limits.getHeapSize()
+    // cannot be read inside one statement, so all five are counted as held at once. That is 11
+    // copies. The status line logged after it holds 7: the response, its copy and the JSON body (3),
+    // and the old and the new log with the body and the response in each (4). The extra 4 KB covers
+    // the log's other lines, held in the old and the new log at once, and the status line, built
+    // before the response is logged. At the worst point they name the endpoint three times, so it
+    // covers an endpoint of up to about 1,200 characters.
     //
-    // What a send still holds when it returns is lower. In a test against a mock it was 4 copies on
-    // success, and 5 on failure once the run stored the error message.
-    private static final Integer SEND_HEAP_BYTES = 13 * LONGEST_BODY_BYTES + 4096;
+    // What a send still holds when it returns is lower. In a test against a mock it was 3 copies on
+    // success, and 4 on failure once the run stored the error message.
+    private static final Integer SEND_HEAP_BYTES = 11 * LONGEST_BODY_BYTES + 4096;
 
     public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
         TB_SendCost cost = new TB_SendCost();
@@ -75,7 +79,11 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
             : 'POST';
 
         ctx.log('Processing Record: ' + ctx.outbox.Id);
-        ctx.log(new List<String>{ method, uri, bodyStr });
+        ctx.log('Request body: ' + bodyStr);
+        // Logged after the body. A log too long for its field keeps its end, and a send that throws
+        // before any answer logs no status line, so with a long body this is the line that still
+        // says where the request went.
+        ctx.log('Sending ' + method + ' ' + uri);
         // replace with carrier
         HttpRequest req = new HttpRequest();
 
@@ -86,9 +94,6 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
             }
         }
 
-
-        ctx.log('body: ' + bodyStr);
-
         req.setEndpoint(uri);
         req.setBody(bodyStr);
         req.setMethod(method);
@@ -96,13 +101,18 @@ public class TB_GenericHttpRelayClient implements TB_IOutboxRelayClient {
         Http http = new Http();
         HTTPResponse res = http.send(req);
         ctx.setResult(new GenericRelayResult(res));
-        ctx.log('Status Code: ' + res.getStatusCode());
+        // Names the method and endpoint again with the status, and is the last line of the attempt. A
+        // log too long for its field keeps its end, and with a long response the lines before this
+        // one are in the part dropped.
+        String statusLine = method + ' ' + uri + ' answered with status ' + res.getStatusCode();
         if (res.getStatusCode() > 300) {
+            ctx.log(statusLine);
             throw new HttpRelayException(
                 'Request Failed with status ' + res.getStatusCode() + '. Response Body: ' + res.getBody()
             );
         }
         ctx.log('Success. Response:' + res.getBody());
+        ctx.log(statusLine);
     }
 
     public class HttpRelayException extends Exception {

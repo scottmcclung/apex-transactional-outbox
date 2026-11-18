@@ -317,6 +317,81 @@ public class TB_TransactionOutboxTestUtils {
         }
     }
 
+    // How many characters the outbox's log field and its error field each hold.
+    public static final Integer LONG_TEXT_FIELD_LENGTH = 131072;
+
+    // The first and last characters of every text longText builds, so a test can tell which end of
+    // a shortened text was kept.
+    public static final String LONG_TEXT_START = 'FIRST-CHARACTERS';
+    public static final String LONG_TEXT_END = 'LAST-CHARACTERS';
+
+    // The one place these tests state how stored text says it was shortened: it contains this word,
+    // in any letter case, wherever the notice is put. Nothing longText builds contains it.
+    public static final String SHORTENED_NOTICE = 'shortened';
+
+    // The most characters a shortened text may give up to its notice. A text shortened to fit keeps
+    // as much of itself as the field has room for, so everything but this much must be the original.
+    public static final Integer SHORTENED_NOTICE_ALLOWANCE = 255;
+
+    public static Boolean saysItWasShortened(String stored) {
+        return stored != null && stored.containsIgnoreCase(SHORTENED_NOTICE);
+    }
+
+    /** A text of exactly the given length, built in one pass so it is held once. */
+    public static String longText(Integer length) {
+        Integer fillerLength = length - LONG_TEXT_START.length() - LONG_TEXT_END.length();
+        System.assert(fillerLength >= 0, 'A long text needs room for its first and last characters');
+        return LONG_TEXT_START + '.'.repeat(fillerLength) + LONG_TEXT_END;
+    }
+
+    // What LongTextClient logged in its last send, as it was given to the log.
+    @testVisible
+    static String longTextClientLogged;
+
+    // The error LongTextClient threw in its last send, laid out the way an outbox records one: the
+    // message, a line break, then the stack trace.
+    @testVisible
+    static String longTextClientError;
+
+    /**
+     * Logs one line and fails with one error, each of the length its subscription's settings give.
+     * "logLength" is the length of the text passed to the log, which then adds its own timestamp.
+     * "errorLength" is the length of the whole error, message and stack trace together. A missing
+     * setting leaves that part out, so settings with no "errorLength" make the send succeed.
+     * "abandonAfterLog" set to 1 makes the send run out of callout time once it has logged.
+     */
+    public class LongTextClient implements TB_IOutboxRelayClient {
+        public TB_SendCost costOfSend(TB_Message_Subscription__mdt subscription) {
+            TB_SendCost cost = inMemorySendCost();
+            // The log and the error are each held a few times over while they are built.
+            cost.cpuTimeMs = 100;
+            cost.heapBytes = 8 * LONG_TEXT_FIELD_LENGTH;
+            return cost;
+        }
+
+        public void send(TB_OutboxRelayContext ctx) {
+            sentMessages.add(ctx.resolvedMessage);
+            Integer logLength = (Integer) ctx.subscriptionConfig.get('logLength');
+            if (logLength != null) {
+                longTextClientLogged = longText(logLength);
+                ctx.log(longTextClientLogged);
+            }
+            if ((Integer) ctx.subscriptionConfig.get('abandonAfterLog') == 1) {
+                throw new CalloutException(CALLOUT_TIME_LIMIT_ERROR);
+            }
+            Integer errorLength = (Integer) ctx.subscriptionConfig.get('errorLength');
+            if (errorLength != null) {
+                // An exception's stack trace is fixed when it is constructed, so its length is known
+                // before the message is sized to make up the rest.
+                TestException e = new TestException();
+                String stackTrace = e.getStackTraceString();
+                e.setMessage(longText(errorLength - 1 - stackTrace.length()));
+                longTextClientError = e.getMessage() + '\n' + stackTrace;
+                throw e;
+            }
+        }
+    }
+
     /** A resolver whose own callouts use up the callout time of the run. */
     public class CalloutTimeLimitResolver implements TB_IOutboxMessageResolver {
         public Map<Id, Object> resolveMessages(TB_Outbox_Message__c[] messages) {

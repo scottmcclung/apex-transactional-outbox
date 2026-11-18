@@ -13,6 +13,7 @@
     <members>TB_OutboxRelayQueuable</members>
     <members>TB_OutboxRelayTests</members>
     <members>TB_OutboxUtils</members>
+    <members>TB_OversizedTextTests</members>
     <members>TB_RecordCleanup</members>
     <members>TB_RecordCleanupTests</members>
     <members>TB_RelayBudgetTests</members>

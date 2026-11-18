@@ -85,8 +85,71 @@ public class TB_OutboxRelayContext {
         this.relayResult = result;
     }
 
+    /**
+     * Adds one line to the log of this attempt. A log too long for its field keeps its end when the
+     * attempt's outcome is stored, as shortenTextToFitFields describes.
+     */
     public void log(Object trace) {
         outbox.Log__c += System.now() + ': ' + trace.toString() + '\n';
+    }
+
+    // Read from the fields, so the shortening follows the fields if either is ever made shorter.
+    private static final Integer LOG_FIELD_LENGTH = TB_Subscription_Outbox__c.Log__c.getDescribe().getLength();
+    private static final Integer ERROR_FIELD_LENGTH = TB_Subscription_Outbox__c.Last_Error_Message__c.getDescribe()
+        .getLength();
+
+    /**
+     * Shortens the log and the error so each fits its field. The platform rejects the whole outbox
+     * update when either is too long, and that update also carries the attempt count, the delivery
+     * and the retry wait, so text that is not shortened loses the outcome of the attempt.
+     *
+     * The error keeps its start, because the message comes before the stack trace. The log keeps its
+     * end, the most recent lines logged. Each says it was shortened and how long it was. Text that
+     * fits is left as it is.
+     *
+     * The length compared is the length of the text as written, line breaks included. In a scratch
+     * org, a log of 131,073 characters ending in a line break saved and was stored as 131,072, and
+     * 131,073 characters with no whitespace at the end failed. A log over the field length only by
+     * a line break at its end is still shortened here.
+     */
+    public void shortenTextToFitFields() {
+        // A field is assigned only when it is shortened. Assigning the log and the error, even to the
+        // values they already hold, costs about 25 bytes of heap for each outbox the run holds.
+        if (outbox.Log__c != null && outbox.Log__c.length() > LOG_FIELD_LENGTH) {
+            outbox.Log__c = keepEnd(outbox.Log__c, LOG_FIELD_LENGTH);
+        }
+        if (outbox.Last_Error_Message__c != null && outbox.Last_Error_Message__c.length() > ERROR_FIELD_LENGTH) {
+            outbox.Last_Error_Message__c = keepStart(outbox.Last_Error_Message__c, ERROR_FIELD_LENGTH);
+        }
+    }
+
+    // Text is measured and cut in 16-bit units, and a character outside the Basic Multilingual Plane
+    // takes two: a high surrogate then a low one. A cut between them keeps half a character, which
+    // the platform saves as U+FFFD, so the cut moves by one unit to keep whole characters only. The
+    // stored text can then be one unit under the field length.
+    private static final Integer FIRST_HIGH_SURROGATE = 55296;
+    private static final Integer LAST_HIGH_SURROGATE = 56319;
+    private static final Integer FIRST_LOW_SURROGATE = 56320;
+    private static final Integer LAST_LOW_SURROGATE = 57343;
+
+    private static String keepStart(String text, Integer fieldLength) {
+        String notice = '\n[Shortened from ' + text.length() + ' characters to fit its field. The end was dropped.]';
+        Integer kept = fieldLength - notice.length();
+        Integer lastKept = text.charAt(kept - 1);
+        if (lastKept >= FIRST_HIGH_SURROGATE && lastKept <= LAST_HIGH_SURROGATE) {
+            kept--;
+        }
+        return text.left(kept) + notice;
+    }
+
+    private static String keepEnd(String text, Integer fieldLength) {
+        String notice = '[Shortened from ' + text.length() + ' characters to fit its field. The start was dropped.]\n';
+        Integer kept = fieldLength - notice.length();
+        Integer firstKept = text.charAt(text.length() - kept);
+        if (firstKept >= FIRST_LOW_SURROGATE && firstKept <= LAST_LOW_SURROGATE) {
+            kept--;
+        }
+        return notice + text.right(kept);
     }
 
     // will be called by OutboxRelay

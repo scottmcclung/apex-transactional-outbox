@@ -8,12 +8,14 @@ public class TB_GenericHttpRelayClientTests {
     // The longest body the message field holds. The client assumes no response is longer.
     static final Integer LONGEST_BODY_LENGTH = 131072;
 
+    static final Integer LOG_FIELD_LENGTH = TB_TransactionOutboxTestUtils.LONG_TEXT_FIELD_LENGTH;
+
     static TB_Message_Subscription__mdt addHttpSubscription(String name) {
         TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
         TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
         TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(app, msgDef, name);
         subscription.Relay_Client__c = 'TB_GenericHttpRelayClient';
-        subscription.Config__c = '{"uri": "https://subscriber.example.com/messages"}';
+        subscription.Config__c = JSON.serialize(new Map<String, String>{ 'uri' => ENDPOINT });
         return subscription;
     }
 
@@ -24,6 +26,81 @@ public class TB_GenericHttpRelayClientTests {
             res.setBody('r'.repeat(LONGEST_BODY_LENGTH));
             return res;
         }
+    }
+
+    static final String ENDPOINT = 'https://subscriber.example.com/messages';
+
+    // Unlike anything else an attempt logs, so each can be counted or found in the log.
+    static final String REQUEST_BODY = 'request-body-of-this-message';
+    static final String SUBSCRIBER_ANSWER = 'answer-from-the-subscriber';
+
+    /** Answers every request with the given status code and body. */
+    public class AnsweringSubscriber implements HttpCalloutMock {
+        private Integer statusCode;
+        private String body;
+
+        public AnsweringSubscriber(Integer statusCode, String body) {
+            this.statusCode = statusCode;
+            this.body = body;
+        }
+
+        public HttpResponse respond(HttpRequest req) {
+            HttpResponse res = new HttpResponse();
+            res.setStatusCode(statusCode);
+            res.setBody(body);
+            return res;
+        }
+    }
+
+    /** Gives no answer, the way a request fails when the subscriber does not reply in time. */
+    public class SilentSubscriber implements HttpCalloutMock {
+        public HttpResponse respond(HttpRequest req) {
+            throw new CalloutException(TB_TransactionOutboxTestUtils.READ_TIMEOUT_ERROR);
+        }
+    }
+
+    static TB_Subscription_Outbox__c relayOverHttp(String requestBody, Integer statusCode, String answer) {
+        return relayOverHttp(requestBody, new AnsweringSubscriber(statusCode, answer));
+    }
+
+    /**
+     * Publishes one message for an HTTP subscription and lets the relay run and its finalizer
+     * finish, so the log and error read back are the ones an operator would see.
+     */
+    static TB_Subscription_Outbox__c relayOverHttp(String requestBody, HttpCalloutMock subscriber) {
+        TB_Message_Subscription__mdt subscription = addHttpSubscription('http_feed');
+        subscription.Retry_BackOff__c = '5';
+        Test.setMock(HttpCalloutMock.class, subscriber);
+
+        Test.startTest();
+        insert new TB_Outbox_Message__c(Type__c = 'test.message1', Message__c = requestBody);
+        Test.stopTest();
+
+        return [
+            SELECT
+                Relay_Attempts__c,
+                Last_Error_Message__c,
+                Log__c,
+                Completed_Timestamp__c,
+                Next_Attempt_Timestamp__c
+            FROM TB_Subscription_Outbox__c
+        ];
+    }
+
+    /**
+     * The line the client logs once the subscriber answers. It names the method and the endpoint
+     * again, so a log shortened to its end still says where the request went.
+     */
+    static String statusLine(Integer statusCode) {
+        return 'POST ' + ENDPOINT + ' answered with status ' + statusCode;
+    }
+
+    /** A text's length and both its ends, for a failure message that stays readable. */
+    static String describe(String text) {
+        if (text == null) {
+            return 'null';
+        }
+        return text.length() + ' characters, from [' + text.left(120) + '] to [' + text.right(120) + ']';
     }
 
     @isTest
@@ -123,6 +200,209 @@ public class TB_GenericHttpRelayClientTests {
         System.assert(
             heapAdded <= cost.heapBytes,
             'The send held more heap than declared: ' + heapAdded + ' bytes against ' + cost.heapBytes
+        );
+    }
+
+    @isTest
+    static void testWhenSubscriberAcceptsThenRequestBodyIsLoggedOnce() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp(REQUEST_BODY, 200, SUBSCRIBER_ANSWER);
+
+        System.assertNotEquals(null, outbox.Completed_Timestamp__c, 'The outbox should be delivered');
+        // The log has to fit one field, and the body can be as long as that field by itself.
+        System.assertEquals(
+            1,
+            outbox.Log__c.countMatches(REQUEST_BODY),
+            'One attempt should log the request body once: ' + outbox.Log__c
+        );
+        System.assert(outbox.Log__c.contains('POST'), 'The log should hold the method: ' + outbox.Log__c);
+        System.assert(outbox.Log__c.contains(ENDPOINT), 'The log should hold the endpoint: ' + outbox.Log__c);
+        System.assert(
+            outbox.Log__c.contains(statusLine(200)),
+            'The log should hold the status line: ' + outbox.Log__c
+        );
+        System.assert(
+            outbox.Log__c.contains(SUBSCRIBER_ANSWER),
+            'The log of a delivery should hold the response body: ' + outbox.Log__c
+        );
+    }
+
+    @isTest
+    static void testWhenSubscriberRejectsThenRequestBodyIsLoggedOnce() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp(REQUEST_BODY, 500, SUBSCRIBER_ANSWER);
+
+        System.assertEquals(1, outbox.Relay_Attempts__c, 'The failed attempt should be counted');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertEquals(
+            1,
+            outbox.Log__c.countMatches(REQUEST_BODY),
+            'One attempt should log the request body once: ' + outbox.Log__c
+        );
+        System.assert(outbox.Log__c.contains('POST'), 'The log should hold the method: ' + outbox.Log__c);
+        System.assert(outbox.Log__c.contains(ENDPOINT), 'The log should hold the endpoint: ' + outbox.Log__c);
+        System.assert(
+            outbox.Log__c.contains(statusLine(500)),
+            'The log should hold the status line: ' + outbox.Log__c
+        );
+    }
+
+    /**
+     * A message can be as long as the log field, and the log holds the method, the endpoint and the
+     * answer as well, so one attempt for the longest message cannot fit however few times the body
+     * is logged. The subscriber has the message by then, so the delivery must still be saved.
+     */
+    @isTest
+    static void testWhenRequestBodyFillsTheLogThenDeliveryIsSavedAndLogKeepsTheAnswer() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp('b'.repeat(LONGEST_BODY_LENGTH), 200, SUBSCRIBER_ANSWER);
+
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The attempt should be counted. A count of 0 means the outcome was not saved'
+        );
+        System.assertNotEquals(
+            null,
+            outbox.Completed_Timestamp__c,
+            'The subscriber accepted the message, so the outbox should be marked delivered'
+        );
+        // The status line is logged after the body, so it is in the end the log keeps.
+        System.assert(
+            outbox.Log__c.contains(statusLine(200)),
+            'The log should keep its end, which names the method, the endpoint and the status, but is ' +
+            describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains(SUBSCRIBER_ANSWER),
+            'The log should keep its end, which holds the response body, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Log__c),
+            'The log should say it was shortened, but is ' + describe(outbox.Log__c)
+        );
+    }
+
+    /**
+     * A response can be as long as the log field by itself. The log keeps its end, so whatever is
+     * logged after the response is what survives, and the method, endpoint and status must be there.
+     */
+    @isTest
+    static void testWhenResponseBodyFillsTheLogThenDeliveryIsSavedAndLogKeepsTheStatusLine() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp(REQUEST_BODY, 200, 'r'.repeat(LONGEST_BODY_LENGTH));
+
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The attempt should be counted. A count of 0 means the outcome was not saved'
+        );
+        System.assertNotEquals(
+            null,
+            outbox.Completed_Timestamp__c,
+            'The subscriber accepted the message, so the outbox should be marked delivered'
+        );
+        System.assert(
+            outbox.Log__c.length() <= LOG_FIELD_LENGTH,
+            'The log should fit its field, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Log__c),
+            'The log should say it was shortened, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains(statusLine(200)),
+            'The log should keep its end, which names the method, the endpoint and the status, but is ' +
+            describe(outbox.Log__c)
+        );
+    }
+
+    /**
+     * A subscriber that refuses the longest message makes a log too long for its field. The status
+     * line is logged after the body, so it is in the end the log keeps.
+     */
+    @isTest
+    static void testWhenSubscriberRejectsBodyThatFillsTheLogThenLogKeepsTheStatusLine() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp('b'.repeat(LOG_FIELD_LENGTH), 500, SUBSCRIBER_ANSWER);
+
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The failed attempt should be counted. A count of 0 means the outcome was not saved'
+        );
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assert(
+            outbox.Log__c.length() <= LOG_FIELD_LENGTH,
+            'The log should fit its field, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Log__c),
+            'The log should say it was shortened, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains(statusLine(500)),
+            'The log should keep its end, which names the method, the endpoint and the status, but is ' +
+            describe(outbox.Log__c)
+        );
+    }
+
+    /**
+     * With no answer there is no status line, so the log ends with what was logged before the send.
+     * For a body as long as the field, the method and the endpoint must still be in that end.
+     */
+    @isTest
+    static void testWhenSendGetsNoAnswerForBodyThatFillsTheLogThenLogStillNamesMethodAndEndpoint() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp('b'.repeat(LOG_FIELD_LENGTH), new SilentSubscriber());
+
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The failed attempt should be counted. A count of 0 means the outcome was not saved'
+        );
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assert(
+            outbox.Log__c.length() <= LOG_FIELD_LENGTH,
+            'The log should fit its field, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Log__c),
+            'The log should say it was shortened, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains('POST'),
+            'The log should keep its end, which names the method, but is ' + describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains(ENDPOINT),
+            'The log should keep its end, which names the endpoint, but is ' + describe(outbox.Log__c)
+        );
+    }
+
+    /**
+     * The client puts the whole response body in its failure message, so a subscriber that answers
+     * a failure with a long body makes an error longer than its field.
+     */
+    @isTest
+    static void testWhenSubscriberRejectsWithLongBodyThenFailedAttemptIsSavedAndErrorKeepsItsStart() {
+        TB_Subscription_Outbox__c outbox = relayOverHttp(REQUEST_BODY, 500, 'r'.repeat(LONGEST_BODY_LENGTH));
+
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The failed attempt should be counted. A count of 0 means the outcome was not saved'
+        );
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The outbox should not be delivered');
+        System.assertNotEquals(
+            null,
+            outbox.Next_Attempt_Timestamp__c,
+            'The failed attempt should wait on its subscription backoff'
+        );
+        System.assertNotEquals(null, outbox.Last_Error_Message__c, 'The reason for the failure should be saved');
+        // The status code is at the start of the client's message, ahead of the response body.
+        System.assert(
+            outbox.Last_Error_Message__c.startsWith('Request Failed with status 500. Response Body: '),
+            'The error should keep its start, which holds the status code, but is ' +
+            describe(outbox.Last_Error_Message__c)
+        );
+        System.assert(
+            TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Last_Error_Message__c),
+            'The error should say it was shortened, but is ' + describe(outbox.Last_Error_Message__c)
         );
     }
 }
