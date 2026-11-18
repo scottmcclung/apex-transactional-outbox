@@ -1000,8 +1000,17 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           );
         }
   
+        // Saves the outcomes the run has not stored. After a run that ended normally those are only
+        // the rows the platform rejected in the run's own save, and this tries them once more. After
+        // a run that a limit ended before its own save they are every outcome, and this is their
+        // first save.
         save();
-  
+        // PLANNED: report each outcome that is still unsaved here through the subscription's log
+        // adapter. A row this save rejects keeps what it had before its attempt, so a delivery is
+        // not recorded and the attempt is never counted toward dead-lettering. The row is still due,
+        // so every later run sends the message again for as long as its save is rejected. Until then
+        // the debug log that save writes is the only record of it.
+
         try {
           TB_Subscription_Outbox__c[] activeOutboxItems = TB_OutboxRelayQueuable.chooseAttemptable(
             1,
@@ -1028,9 +1037,11 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
        * An exception thrown while building or calling an action is caught and written to the debug
        * log, and the other subscriptions' actions are still called.
        *
-       * Actions run in the finalizer's transaction, after the results are saved and the next run is
-       * queued. A failure that cannot be caught, such as a governor limit, ends that transaction. The
-       * remaining actions are not called, and the saved results and the queued run are rolled back.
+       * Actions run in the finalizer's transaction, after the save of the results has been tried and
+       * the next run is queued. An outcome whose save the platform rejected is still passed to its
+       * action, so an action cannot take an attempt it is given as one that is stored. A failure that
+       * cannot be caught, such as a governor limit, ends that transaction. The remaining actions are
+       * not called, and the saved results and the queued run are rolled back.
        */
       private void executeAfterActions() {
         Map<String, List<TB_OutboxRelayContext>> resultsBySubscription = new Map<String, List<TB_OutboxRelayContext>>();

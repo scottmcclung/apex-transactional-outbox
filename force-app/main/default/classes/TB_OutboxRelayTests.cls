@@ -4591,4 +4591,241 @@ public class TB_OutboxRelayTests {
         assertOutboxIsUntouched(outboxes[1], 'The run reached a limit before this outbox\'s turn.');
         System.assertEquals(0, TB_TransactionOutboxTestUtils.sentMessages.size(), 'Nothing should be sent');
     }
+
+    static final String UNSAVEABLE_OUTBOX_CLIENT = 'TB_TransactionOutboxTestUtils.UnsaveableOutboxClient';
+
+    /**
+     * Runs one relay run for these messages in a job that, between the run's save and its finalizer,
+     * records what is stored and makes the rejected outboxes saveable again.
+     *
+     * The run executes inside that job, which relayJobCount does not count, and the publish queues
+     * no run. So after this a count of 0 means the finalizer queued no further run.
+     */
+    static void relayThenMendBeforeTheFinalizer(List<TB_Outbox_Message__c> messages) {
+        Test.startTest();
+        // The publish must not queue a run of its own. That run would have nothing after it but its
+        // finalizer, and would leave no outbox for the run this test follows.
+        TB_OutboxRelayQueuable.alreadyQueuedInContext = true;
+        insert messages;
+        System.enqueueJob(new TB_TransactionOutboxTestUtils.RelayRunThenMend());
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        stopTestExpectingNoFailedJob();
+    }
+
+    /** The run's own save left this outbox as it was before its attempt, so the test is about a retry. */
+    static void assertRunSaveWasRejected(TB_Subscription_Outbox__c outbox) {
+        TB_Subscription_Outbox__c stored = TB_TransactionOutboxTestUtils.storedAfterRunSave.get(outbox.Id);
+        System.assertEquals(
+            0,
+            stored.Relay_Attempts__c,
+            'The run\'s save should have been rejected for ' + outbox.Subscription__c + ', leaving no attempt counted'
+        );
+        System.assertEquals(
+            null,
+            stored.Completed_Timestamp__c,
+            'The run\'s save should have been rejected for ' + outbox.Subscription__c + ', leaving it undelivered'
+        );
+    }
+
+    /**
+     * A run saves its outcomes with one update that keeps the rows the platform accepts. A row it
+     * rejects is tried once more by the finalizer. Here the subscriber took the message and the
+     * first save of that outcome was rejected, so without the second save the outbox would still
+     * look undelivered and the next run would send the message again.
+     */
+    @isTest
+    static void testWhenRunSaveOfADeliveryIsRejectedThenTheFinalizerSavesIt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        subscription.Relay_Client__c = UNSAVEABLE_OUTBOX_CLIENT;
+        subscription.After_Relay_Action__c = RECORDING_ACTION;
+
+        relayThenMendBeforeTheFinalizer(new List<TB_Outbox_Message__c>{ newMessage(msgDef) });
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        assertRunSaveWasRejected(outbox);
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The finalizer should save the attempt the run could not. A count of 0 means it was not saved'
+        );
+        System.assertNotEquals(
+            null,
+            outbox.Completed_Timestamp__c,
+            'The subscriber got the message, so the finalizer should store the outbox as delivered'
+        );
+        System.assertNotEquals(null, outbox.Last_Attempt__c, 'The time of the attempt should be saved');
+        System.assertEquals(null, outbox.Last_Error_Message__c, 'A delivery should record no error');
+
+        System.assertEquals(
+            new Map<String, Set<Id>>{ 'subscription1' => new Set<Id>{ outbox.Id } },
+            actionCallsBySubscription(),
+            'The after-relay action should be called once with the attempt'
+        );
+        System.assertEquals(
+            new List<Integer>{ 1 },
+            TB_TransactionOutboxTestUtils.actionSavedCounts,
+            'The attempt should be stored by the time the action runs'
+        );
+
+        assertFinalizerWasFreeToQueue();
+        System.assertEquals(0, relayJobCount(), 'A delivery that is stored should not start another run');
+        System.assertEquals(1, TB_TransactionOutboxTestUtils.sentMessages.size(), 'The message should be sent once');
+    }
+
+    /**
+     * The same retry for an attempt that failed. Its count, its error and its wait are all in the
+     * rejected update, so without the second save the outbox would be attempted again at once and
+     * that failure would never count toward dead-lettering.
+     */
+    @isTest
+    static void testWhenRunSaveOfAFailedAttemptIsRejectedThenTheFinalizerSavesIt() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        subscription.Relay_Client__c = UNSAVEABLE_OUTBOX_CLIENT;
+        subscription.Config__c = '{"throwError":true}';
+        subscription.Retry_BackOff__c = '30';
+
+        relayThenMendBeforeTheFinalizer(new List<TB_Outbox_Message__c>{ newMessage(msgDef) });
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        assertRunSaveWasRejected(outbox);
+        System.assertEquals(
+            1,
+            outbox.Relay_Attempts__c,
+            'The finalizer should save the failed attempt the run could not. A count of 0 means it was not saved'
+        );
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'A failed attempt should not be marked delivered');
+        System.assertNotEquals(null, outbox.Last_Error_Message__c, 'The reason for the failure should be saved');
+        System.assert(
+            outbox.Last_Error_Message__c.startsWith('Test Error'),
+            'The error should be the one the client threw, but is: ' + outbox.Last_Error_Message__c
+        );
+        System.assertNotEquals(
+            null,
+            outbox.Next_Attempt_Timestamp__c,
+            'The failed attempt should wait on its subscription backoff'
+        );
+
+        assertFinalizerWasFreeToQueue();
+        System.assertEquals(0, relayJobCount(), 'An outbox waiting on its backoff should not start another run');
+    }
+
+    /**
+     * The finalizer's save is for the rows the run's save left unsaved, and for no others. An
+     * outbox the run stored may have been changed by something else since, and saving the run's
+     * copy again would undo that. Here the stored log is changed between the two saves and has to
+     * survive the second.
+     */
+    @isTest
+    static void testWhenRunSaveIsRejectedForOneOutboxThenTheFinalizerLeavesTheOutboxesAlreadySavedAlone() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        addTestClientSubscription(app, msgDef, 'subscription1');
+        TB_TransactionOutboxTestUtils.addSubscription(app, msgDef, 'subscription2')
+            .Relay_Client__c = UNSAVEABLE_OUTBOX_CLIENT;
+
+        relayThenMendBeforeTheFinalizer(new List<TB_Outbox_Message__c>{ newMessage(msgDef) });
+
+        List<TB_Subscription_Outbox__c> outboxes = outboxesInOrder();
+        System.assertEquals(2, outboxes.size());
+
+        TB_Subscription_Outbox__c savedByRun = TB_TransactionOutboxTestUtils.storedAfterRunSave.get(outboxes[0].Id);
+        System.assertEquals(1, savedByRun.Relay_Attempts__c, 'The run should save the outbox the platform accepted');
+        System.assertNotEquals(null, savedByRun.Completed_Timestamp__c, 'The run should store that outbox as delivered');
+        assertRunSaveWasRejected(outboxes[1]);
+
+        System.assertEquals(
+            TB_TransactionOutboxTestUtils.LOG_WRITTEN_BETWEEN_SAVES,
+            [SELECT Log__c FROM TB_Subscription_Outbox__c WHERE Id = :outboxes[0].Id].Log__c,
+            'The finalizer should not save an outbox the run already saved. Its log was changed after the run\'s save'
+        );
+
+        System.assertEquals(1, outboxes[1].Relay_Attempts__c, 'The finalizer should save the attempt the run could not');
+        System.assertNotEquals(
+            null,
+            outboxes[1].Completed_Timestamp__c,
+            'The finalizer should store the rejected outbox as delivered'
+        );
+    }
+
+    /**
+     * Pins what happens today when the finalizer's save is rejected as well.
+     *
+     * PLANNED: a row whose save is rejected twice is reported through the subscription's log
+     * adapter. This test should then expect that report.
+     *
+     * Today the run and its finalizer finish as if nothing went wrong and the outcome is written
+     * only to the debug log. The after-relay action is still given the attempt as a delivery. The
+     * stored outbox is as it was before the attempt, so it is still due, another run is queued at
+     * once, and that run sends the message again. No attempt is ever counted, so the outbox cannot
+     * dead-letter.
+     *
+     * The counts of 2 below are where the test stops, not the size of the problem. The test clears
+     * the run's guard once, and the first finalizer's queuing sets the publisher's guard again, so
+     * the second run's finalizer cannot queue a third. In production each finalizer starts with both
+     * guards unset, so runs follow one another with no wait, each sending the message again, for as
+     * long as the row is rejected.
+     *
+     * Nothing is stored whether or not the finalizer tries its save, so this test cannot tell if
+     * the second save was tried. The three tests above pin the retry. This one pins what follows
+     * when the retry is rejected too.
+     */
+    @isTest
+    static void testWhenBothSavesOfADeliveryAreRejectedThenTodayNothingIsStoredAndTheNextRunSendsAgain() {
+        TB_Application__mdt app = TB_TransactionOutboxTestUtils.addApplication('TestApp');
+        TB_Message_Definition__mdt msgDef = TB_TransactionOutboxTestUtils.addEventDefinition('test.message1');
+        TB_Message_Subscription__mdt subscription = TB_TransactionOutboxTestUtils.addSubscription(
+            app,
+            msgDef,
+            'subscription1'
+        );
+        subscription.Relay_Client__c = UNSAVEABLE_OUTBOX_CLIENT;
+        subscription.After_Relay_Action__c = RECORDING_ACTION;
+
+        Test.startTest();
+        insert newMessage(msgDef);
+        TB_TransactionOutboxTestUtils.letFinalizerQueueNextRun();
+        stopTestExpectingNoFailedJob();
+
+        TB_Subscription_Outbox__c outbox = outboxesInOrder()[0];
+        System.assertEquals(0, outbox.Relay_Attempts__c, 'No attempt is counted when neither save is accepted');
+        System.assertEquals(null, outbox.Completed_Timestamp__c, 'The delivery is not stored');
+        System.assertEquals(null, outbox.Last_Attempt__c, 'The time of the attempt is not stored');
+        System.assertEquals(null, outbox.Last_Error_Message__c, 'Nothing about the rejected save is put on the outbox');
+        System.assertEquals(false, outbox.Dead_Lettered__c, 'The outbox is not dead-lettered');
+
+        System.assertEquals(2, relayJobCount(), 'The outbox is still due, so the finalizer queues another run');
+        System.assertEquals(
+            2,
+            TB_TransactionOutboxTestUtils.sentMessages.size(),
+            'The second run sends the message the subscriber already has'
+        );
+
+        System.assertEquals(
+            2,
+            TB_TransactionOutboxTestUtils.actionCalls.size(),
+            'The after-relay action is called in each run, whether or not the attempt was stored'
+        );
+        for (List<TB_OutboxRelayContext> call : TB_TransactionOutboxTestUtils.actionCalls) {
+            System.assertEquals(1, call.size());
+            System.assertEquals(outbox.Id, call[0].outbox.Id);
+            System.assert(call[0].isComplete(), 'The action is told the message was delivered');
+        }
+        System.assertEquals(
+            new List<Integer>{ 0, 0 },
+            TB_TransactionOutboxTestUtils.actionSavedCounts,
+            'The attempt is not stored when the action runs'
+        );
+    }
 }
