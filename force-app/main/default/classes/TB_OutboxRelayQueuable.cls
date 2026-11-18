@@ -6,8 +6,15 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
   
     /**
      * One relay run. It attempts at most the configured batch size and leaves the rest for the next run.
-     * It does not check the remaining platform limits before an attempt. A run cut short by a limit
-     * relies on the finalizer to store what was done.
+     *
+     * Before each attempt it asks the relay client what one send needs, and compares that with what the
+     * run has left of each limit it works within. An outbox it has no room for is passed over: it is not
+     * charged an attempt and is left as it is, and the run goes on to the next outbox. The run's first
+     * attempt is not checked for room, for the reason given on RunBudget. If a send reaches a limit
+     * anyway and the platform's error can be caught, that attempt is abandoned and the run starts
+     * nothing more. Either way the run ends normally, saves its outcomes, and its finalizer queues the
+     * next run. A limit the platform does not let code catch still ends the run part-way, and the
+     * finalizer stores what was done.
      */
     public void execute(QueueableContext ctx) {
       executeStart = System.now();
@@ -36,6 +43,9 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           definitionsByName
         )
       );
+
+      // Begun just before the message resolvers, the first code in the run that may make a callout.
+      RunBudget budget = new RunBudget();
 
       // transform DTO's
       Map<Id, Object> allResolvedMessages = resolveMessages(
@@ -68,9 +78,21 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           );
         } else if (turn == TurnOutcome.ATTEMPT) {
           Object resolvedEvt = allResolvedMessages.get(item.Outbox_Message__c);
-          Boolean delivered = attemptRelay(item, resolvedEvt, subDef, finalizer);
-          if (!delivered) {
+          AttemptOutcome outcome = attemptRelay(
+            item,
+            resolvedEvt,
+            subDef,
+            finalizer,
+            budget
+          );
+          if (outcome == AttemptOutcome.FAILED) {
             turns.sendFailed(item);
+          } else if (outcome == AttemptOutcome.NO_ROOM) {
+            turns.noRoom(item);
+          } else if (outcome == AttemptOutcome.ABANDONED) {
+            // A run that has reached one of its limits starts nothing more. The outboxes after this
+            // one are left as they are for the next run.
+            break;
           }
         }
       }
@@ -85,7 +107,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      *
      * It takes the same turns the run takes, starting from the holds the run has now. Whether a send
      * fails is not known yet, so each planned attempt is counted as one that may fail. An outbox a
-     * failed send would hold is still planned, and the run may then not attempt it.
+     * failed send would hold is still planned, and the run may then not attempt it. The same goes for
+     * an outbox the run turns out to have no room for, and for one after an abandoned attempt.
      */
     private static List<TB_Subscription_Outbox__c> plannedAttempts(
       List<TB_Subscription_Outbox__c> outboxRecords,
@@ -148,25 +171,64 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
       return finalizer;
     }
   
+    /** How one relay attempt ended, or why none was made. */
+    private enum AttemptOutcome {
+      DELIVERED,
+      FAILED,
+      // Nothing was attempted, because the run has too little left for what one send needs.
+      NO_ROOM,
+      // The run reached one of its own limits during the attempt, so the attempt is not counted.
+      ABANDONED
+    }
+
     /**
-     * Makes one relay attempt for an outbox and hands the outcome to the finalizer.
-     * Returns whether the attempt finished without an exception.
+     * Makes one relay attempt for an outbox when the run has room for it or has not started an attempt
+     * yet, and hands the outcome to the finalizer. The attempt is delivered when it finished without
+     * an exception, and failed otherwise.
+     *
+     * The relay client is built and asked what one send needs before the attempt is counted. When the
+     * run has too little left of any limit for that, nothing is attempted and the outbox is not handed
+     * to the finalizer, so it stays as it is. The run's first attempt goes ahead without that check.
+     * A client that cannot be built, or whose cost cannot be used, fails the counted attempt before
+     * anything is sent, like any other fault of the client. That attempt does not use up the run's
+     * first attempt.
+     *
      * A subscription config that cannot be read fails the counted attempt before anything is sent,
      * and the outbox waits on its subscription's backoff like any failed attempt.
      */
-    private Boolean attemptRelay(
+    private AttemptOutcome attemptRelay(
       TB_Subscription_Outbox__c item,
       Object resolvedEvt,
       TB_Message_Subscription__mdt subDef,
-      OutboxFinalizer finalizer
+      OutboxFinalizer finalizer,
+      RunBudget budget
     ) {
       TB_OutboxRelayContext obCtx = new TB_OutboxRelayContext(
         item,
         resolvedEvt,
         subDef
       );
-  
-      Boolean delivered = false;
+
+      TB_IOutboxRelayClient client;
+      try {
+        client = TB_OutboxMetadataProvider.getSubscriptionRelayClient(subDef);
+        // Read before the first-attempt rule is applied, so a declaration that cannot be used fails
+        // the first attempt too.
+        TB_SendCost cost = declaredCostOfSend(client, subDef);
+        if (budget.hasStartedAnAttempt() && !budget.hasRoomFor(cost)) {
+          return AttemptOutcome.NO_ROOM;
+        }
+      } catch (Exception e) {
+        obCtx.setAttempt();
+        obCtx.setError(e);
+        finalizer.addResult(obCtx);
+        return AttemptOutcome.FAILED;
+      }
+      budget.attemptStarted();
+
+      // A client may replace the TTL during its send, and an abandoned attempt must not keep that.
+      Datetime ttlBeforeAttempt = item.TTL__c;
+      AttemptOutcome outcome = AttemptOutcome.FAILED;
       try {
         obCtx.setAttempt();
   
@@ -175,20 +237,222 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           throw (Exception) resolvedEvt;
         }
   
-        TB_IOutboxRelayClient client = TB_OutboxMetadataProvider.getSubscriptionRelayClient(
-          subDef
-        );
         obCtx.requireReadableConfig();
         client.send(obCtx);
         obCtx.setSuccess();
-        delivered = true;
+        outcome = AttemptOutcome.DELIVERED;
       } catch (Exception e) {
-        obCtx.setError(e);
+        if (isRunLimitError(e)) {
+          abandon(obCtx, ttlBeforeAttempt, e);
+          outcome = AttemptOutcome.ABANDONED;
+        } else {
+          obCtx.setError(e);
+        }
       } finally {
-        //TODO: should this be added before? What happens if limit exception is thrown?
+        // A limit raised as System.LimitException cannot be caught and ends the transaction without
+        // reaching here, so that outbox is left as it was and the finalizer saves the others.
         finalizer.addResult(obCtx);
       }
-      return delivered;
+      return outcome;
+    }
+
+    // The start of the message the platform gives when the callouts of one transaction have taken
+    // longer in total than it allows. The limit's value follows in the message and is left out, so
+    // the match does not depend on it.
+    private static final String CALLOUT_TIME_LIMIT_MESSAGE = 'Exceeded maximum time allotted for callout';
+
+    /**
+     * Whether an exception caught during an attempt means the run reached one of its own limits.
+     *
+     * The platform raises most limits as System.LimitException, which no catch block receives, so
+     * they never get here. Total callout time is different: the callout that goes over it throws a
+     * System.CalloutException, which can be caught. A subscriber that does not answer in time also
+     * throws a CalloutException, and that is a real failure of the attempt, so the limit is
+     * recognised by the type and the start of the message together. A client that catches the error
+     * and throws its own exception instead has its attempt counted as failed.
+     */
+    private static Boolean isRunLimitError(Exception e) {
+      return e instanceof System.CalloutException &&
+        e.getMessage() != null &&
+        e.getMessage().startsWith(CALLOUT_TIME_LIMIT_MESSAGE);
+    }
+
+    /**
+     * Undoes the parts of an attempt that would charge the outbox for a limit the run reached. That is
+     * the run's doing and says nothing about the subscriber, so the attempt is not counted, no error is
+     * recorded and no wait is added, not even one the client asked for. An outbox on its last attempt
+     * is therefore not dead-lettered. A TTL the client set during the attempt is put back to what the
+     * outbox had before it, because only a delivered or failed attempt keeps what the client chose.
+     * The attempt time and whatever the attempt logged are kept, so the outbox still shows that an
+     * attempt was started and how far it got.
+     */
+    private static void abandon(
+      TB_OutboxRelayContext obCtx,
+      Datetime ttlBeforeAttempt,
+      Exception e
+    ) {
+      obCtx.outbox.Relay_Attempts__c--;
+      obCtx.outbox.Next_Attempt_Timestamp__c = null;
+      obCtx.outbox.TTL__c = ttlBeforeAttempt;
+      // PLANNED: report the abandoned attempt through the subscription's log adapter, so a client that
+      // uses more than it declares gets noticed. Until then the debug log is the only record of why.
+      System.debug(
+        'Relay attempt abandoned at a run limit for outbox ' +
+          obCtx.outbox.Id +
+          ': ' +
+          e.getMessage()
+      );
+    }
+
+    /**
+     * What the relay client says one send for this subscription needs, checked so it can be compared
+     * with what the run has left. A cost that is missing, or has a field that is unset or negative,
+     * cannot be compared, and is the client's fault. An unset field is never taken to mean 0.
+     */
+    private static TB_SendCost declaredCostOfSend(
+      TB_IOutboxRelayClient client,
+      TB_Message_Subscription__mdt subDef
+    ) {
+      String clientName = subDef.Relay_Client__c;
+      TB_SendCost cost;
+      try {
+        cost = client.costOfSend(subDef);
+      } catch (Exception e) {
+        throw new SendCostException(
+          'Relay client ' +
+            clientName +
+            ' could not state the cost of a send, so nothing was sent. It raised ' +
+            e.getTypeName() +
+            ': ' +
+            e.getMessage(),
+          e
+        );
+      }
+      if (cost == null) {
+        throw new SendCostException(
+          'Relay client ' +
+            clientName +
+            ' stated no cost for a send, so the run could not tell whether it had room for one. Nothing was sent.'
+        );
+      }
+      // The fields are checked one by one, without building a map, because this runs before every
+      // attempt.
+      requireUsableAmount(clientName, 'callouts', cost.callouts);
+      requireUsableAmount(clientName, 'calloutTimeMs', cost.calloutTimeMs);
+      requireUsableAmount(clientName, 'queries', cost.queries);
+      requireUsableAmount(clientName, 'queryRows', cost.queryRows);
+      requireUsableAmount(clientName, 'dmlStatements', cost.dmlStatements);
+      requireUsableAmount(clientName, 'dmlRows', cost.dmlRows);
+      requireUsableAmount(clientName, 'eventPublishes', cost.eventPublishes);
+      requireUsableAmount(clientName, 'cpuTimeMs', cost.cpuTimeMs);
+      requireUsableAmount(clientName, 'heapBytes', cost.heapBytes);
+      return cost;
+    }
+
+    private static void requireUsableAmount(
+      String clientName,
+      String field,
+      Integer amount
+    ) {
+      if (amount == null || amount < 0) {
+        throw new SendCostException(
+          'Relay client ' +
+            clientName +
+            ' stated ' +
+            (amount == null ? 'no value' : 'a negative value') +
+            ' for ' +
+            field +
+            ' in the cost of a send. Every field must be 0 or more. Nothing was sent.'
+        );
+      }
+    }
+
+    private class SendCostException extends Exception {
+    }
+
+    /**
+     * Whether a send that needs this cost fits in what is left. It fits when it needs no more than is
+     * left of every limit. A send that needs exactly what is left fits, and so does a send that needs
+     * none of a limit that is used up.
+     */
+    @TestVisible
+    static Boolean hasBudgetFor(TB_SendCost cost, TB_SendCost left) {
+      return cost.callouts <= left.callouts &&
+        cost.calloutTimeMs <= left.calloutTimeMs &&
+        cost.queries <= left.queries &&
+        cost.queryRows <= left.queryRows &&
+        cost.dmlStatements <= left.dmlStatements &&
+        cost.dmlRows <= left.dmlRows &&
+        cost.eventPublishes <= left.eventPublishes &&
+        cost.cpuTimeMs <= left.cpuTimeMs &&
+        cost.heapBytes <= left.heapBytes;
+    }
+
+    // The most time the callouts of one transaction may take in total, in milliseconds. Salesforce
+    // documents it as 120 seconds. It is a platform limit and not a setting. The Limits class has no
+    // method for it or for the time used against it, so it is stated here and the run keeps its own
+    // count.
+    private static final Integer CALLOUT_TIME_LIMIT_MS = 120000;
+
+    /**
+     * What one run has left of the limits it works within, read at the moment of each check.
+     * It belongs to one run, so a later run starts with the full amounts again.
+     *
+     * Eight of the limits come from the Limits class. Callout time does not, so the run counts the time
+     * on the clock since the budget began. Apex makes callouts one at a time and waits for each, so that
+     * time is never less than what callouts have taken. It also counts CPU time and queries, which only
+     * makes the run stop sooner. Adding up what each send declared would stop it much sooner: the HTTP
+     * client declares its whole timeout of 10 seconds, which would allow 12 sends where most take a
+     * fraction of a second. Timing only the sends would miss callouts made by a message resolver.
+     *
+     * Nothing is kept back for the save at the end of the run. If that save goes over a limit, the
+     * finalizer saves the outcomes in its own transaction.
+     *
+     * The room check applies from the run's second attempt on. The first attempt goes ahead whatever
+     * is left. A run that could attempt nothing would leave every outbox as it was, and its finalizer
+     * would queue the next run in the same state, without end. At worst that one send overruns a
+     * limit, and the attempt is abandoned or the job fails. An attempt counts as the first once its
+     * client is built and its cost is read and usable, whatever then becomes of it. An outbox failed
+     * before that, for missing configuration, a client that cannot be built or a cost that cannot be
+     * used, sends nothing and leaves the first attempt still to come.
+     */
+    private class RunBudget {
+      // System.currentTimeMillis() when the budget began.
+      private Long startedAtMs = System.currentTimeMillis();
+      // Whether this run has started an attempt past building its client and reading its cost,
+      // whatever then became of it.
+      private Boolean anAttemptHasStarted = false;
+
+      public Boolean hasStartedAnAttempt() {
+        return anAttemptHasStarted;
+      }
+
+      public void attemptStarted() {
+        anAttemptHasStarted = true;
+      }
+
+      public Boolean hasRoomFor(TB_SendCost cost) {
+        return hasBudgetFor(cost, left());
+      }
+
+      private TB_SendCost left() {
+        TB_SendCost left = new TB_SendCost();
+        left.callouts = Limits.getLimitCallouts() - Limits.getCallouts();
+        left.calloutTimeMs =
+          CALLOUT_TIME_LIMIT_MS -
+          (System.currentTimeMillis() - startedAtMs).intValue();
+        left.queries = Limits.getLimitQueries() - Limits.getQueries();
+        left.queryRows = Limits.getLimitQueryRows() - Limits.getQueryRows();
+        left.dmlStatements =
+          Limits.getLimitDmlStatements() - Limits.getDmlStatements();
+        left.dmlRows = Limits.getLimitDmlRows() - Limits.getDmlRows();
+        left.eventPublishes =
+          Limits.getLimitPublishImmediateDML() -
+          Limits.getPublishImmediateDML();
+        left.cpuTimeMs = Limits.getLimitCpuTime() - Limits.getCpuTime();
+        left.heapBytes = Limits.getLimitHeapSize() - Limits.getHeapSize();
+        return left;
+      }
     }
   
     private static Set<String> subscriptionNamesOf(
@@ -531,7 +795,8 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
      * publish order, and keeps what each turn leaves for the turns after it.
      *
      * The decision rests on what came before in the run and on configuration, and not on how a send
-     * turns out. The one outcome that changes later turns is a failed send, which the caller reports.
+     * turns out or whether the run has room for it. Two outcomes change later turns, and the caller
+     * reports both: a failed send, and an outbox passed over because the run had no room for its send.
      *
      * Turns taken before any attempt, to plan the run, report each planned send as one that may fail
      * instead. A turn that a failed send could hold may then come out differently in the run, so it
@@ -586,6 +851,11 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
           return TurnOutcome.PASSED_OVER;
         }
 
+        // This counts toward isolation even when the run then has no room for the send, because the
+        // plan cannot know about room and the run keeps to outboxes the plan resolved messages for.
+        // An outbox is passed over for lack of room only after an attempt has started, and an
+        // isolated outbox gets here only before any has, so an isolated outbox is never passed over
+        // for lack of room.
         isFirst = false;
         if (subDef.Isolate_Relay__c) {
           isolatedAttempted = true;
@@ -595,6 +865,14 @@ public class TB_OutboxRelayQueuable implements Queueable, Database.AllowsCallout
 
       /** A send that fails holds the messages after its outbox in its group. */
       public void sendFailed(TB_Subscription_Outbox__c item) {
+        holds.hold(item);
+      }
+
+      /**
+       * An outbox passed over because the run had no room for its send is still undelivered, so it
+       * holds the messages after it in its group, the same as a failed send.
+       */
+      public void noRoom(TB_Subscription_Outbox__c item) {
         holds.hold(item);
       }
 

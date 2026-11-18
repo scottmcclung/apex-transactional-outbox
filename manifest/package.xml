@@ -15,6 +15,7 @@
     <members>TB_OutboxUtils</members>
     <members>TB_RecordCleanup</members>
     <members>TB_RecordCleanupTests</members>
+    <members>TB_RelayBudgetTests</members>
      <members>TB_ScheduleRelay</members>
     <members>TB_ScheduleRelayTest</members>
     <members>TB_SendCost</members>
