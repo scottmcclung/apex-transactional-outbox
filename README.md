@@ -166,6 +166,8 @@ Set every field of `TB_SendCost`. Use 0 for anything a send does not use. A cost
 | `cpuTimeMs` | CPU time, in milliseconds |
 | `heapBytes` | Heap, in bytes. This is the highest the send raises the heap above where it stood when the send began, at any point during the send, including what it still holds when it returns. |
 
+Declare at least 262,144 bytes more than the send still holds when it returns, because the run then shortens a log or error longer than its 131,072-character field and briefly holds up to two field lengths on top of the original text, as counted from the code.
+
 A declaration the run cannot use fails the attempt. That covers `costOfSend` throwing, returning null, or returning a cost with a field that is null or negative. The attempt is counted, nothing is sent, and `Last_Error_Message__c` names the relay client and, for a bad field, the field. The outbox then waits on its subscription's retry backoff like any failed attempt.
 
 `TB_GenericHttpRelayClient` declares:
@@ -358,4 +360,6 @@ However, these should be used sparingly and with caution:
 - Make sure to always check limits for queries, DML & do not make additional callouts. If an action triggers an "uncatchable exception", it could cause the message results to be lost in some cases and may halt the chaining of the relay job.
 
 **It is recommended that your AfterRelayAction publishes an "Immediate Platform Event" to handle additional processing.**
+
+An action sees each outbox's `Log__c` and `Last_Error_Message__c` as they are stored. A log or error too long for its field has already been shortened. The error keeps its start, the log keeps its end, and each says it was shortened. `relayResult` is not shortened. For `TB_GenericHttpRelayClient` it holds the whole response body, on success and on failure.
 
