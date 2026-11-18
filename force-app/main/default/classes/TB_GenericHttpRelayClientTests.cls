@@ -74,6 +74,14 @@ public class TB_GenericHttpRelayClientTests {
         ];
     }
 
+    /**
+     * The line the client logs once the subscriber answers. It names the method and the endpoint
+     * again, so a log shortened to its end still says where the request went.
+     */
+    static String statusLine(Integer statusCode) {
+        return 'POST ' + ENDPOINT + ' answered with status ' + statusCode;
+    }
+
     /** A text's length and both its ends, for a failure message that stays readable. */
     static String describe(String text) {
         if (text == null) {
@@ -195,7 +203,10 @@ public class TB_GenericHttpRelayClientTests {
         );
         System.assert(outbox.Log__c.contains('POST'), 'The log should hold the method: ' + outbox.Log__c);
         System.assert(outbox.Log__c.contains(ENDPOINT), 'The log should hold the endpoint: ' + outbox.Log__c);
-        System.assert(outbox.Log__c.contains('200'), 'The log should hold the status code: ' + outbox.Log__c);
+        System.assert(
+            outbox.Log__c.contains(statusLine(200)),
+            'The log should hold the status line: ' + outbox.Log__c
+        );
         System.assert(
             outbox.Log__c.contains(SUBSCRIBER_ANSWER),
             'The log of a delivery should hold the response body: ' + outbox.Log__c
@@ -215,7 +226,10 @@ public class TB_GenericHttpRelayClientTests {
         );
         System.assert(outbox.Log__c.contains('POST'), 'The log should hold the method: ' + outbox.Log__c);
         System.assert(outbox.Log__c.contains(ENDPOINT), 'The log should hold the endpoint: ' + outbox.Log__c);
-        System.assert(outbox.Log__c.contains('500'), 'The log should hold the status code: ' + outbox.Log__c);
+        System.assert(
+            outbox.Log__c.contains(statusLine(500)),
+            'The log should hold the status line: ' + outbox.Log__c
+        );
     }
 
     /**
@@ -237,9 +251,16 @@ public class TB_GenericHttpRelayClientTests {
             outbox.Completed_Timestamp__c,
             'The subscriber accepted the message, so the outbox should be marked delivered'
         );
+        // The method and endpoint logged before the send are in the part dropped, so these come from
+        // the status line logged after it.
         System.assert(
-            outbox.Log__c.contains('200') && outbox.Log__c.contains(SUBSCRIBER_ANSWER),
-            'The log should keep its end, which holds what the subscriber answered, but is ' + describe(outbox.Log__c)
+            outbox.Log__c.contains(statusLine(200)),
+            'The log should keep its end, which names the method, the endpoint and the status, but is ' +
+            describe(outbox.Log__c)
+        );
+        System.assert(
+            outbox.Log__c.contains(SUBSCRIBER_ANSWER),
+            'The log should keep its end, which holds the response body, but is ' + describe(outbox.Log__c)
         );
         System.assert(
             TB_TransactionOutboxTestUtils.saysItWasShortened(outbox.Log__c),
@@ -269,7 +290,7 @@ public class TB_GenericHttpRelayClientTests {
         System.assertNotEquals(null, outbox.Last_Error_Message__c, 'The reason for the failure should be saved');
         // The status code is at the start of the client's message, ahead of the response body.
         System.assert(
-            outbox.Last_Error_Message__c.left(200).contains('500'),
+            outbox.Last_Error_Message__c.startsWith('Request Failed with status 500. Response Body: '),
             'The error should keep its start, which holds the status code, but is ' +
             describe(outbox.Last_Error_Message__c)
         );
