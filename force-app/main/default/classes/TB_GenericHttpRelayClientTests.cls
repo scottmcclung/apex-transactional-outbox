@@ -299,7 +299,7 @@ public class TB_GenericHttpRelayClientTests {
             'The subscriber accepted the message, so the outbox should be marked delivered'
         );
         System.assert(
-            outbox.Log__c.length() <= LONGEST_BODY_LENGTH,
+            outbox.Log__c.length() <= LOG_FIELD_LENGTH,
             'The log should fit its field, but is ' + describe(outbox.Log__c)
         );
         System.assert(
