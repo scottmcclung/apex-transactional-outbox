@@ -80,3 +80,5 @@ The branch read higher run CPU than main at every size in this session. The 1 an
 `RunLocalTests` on this code in `outbox-dev`: 189 run, 189 passed, 0 failed.
 
 Every `reproduce.js` scenario matched the Reproduce table above. `oversized-text` stored the error with its start and a shortened notice at its end. It stored the log with a shortened notice at its start and `OVERSIZED-END` at its end. The after-relay action printed one context.
+
+`RunLocalTests` on the code that was merged in `7ba5df0`, in `outbox-dev`: 191 run, 191 passed, 0 failed, in test run `707Ru00002LxlAD`.
