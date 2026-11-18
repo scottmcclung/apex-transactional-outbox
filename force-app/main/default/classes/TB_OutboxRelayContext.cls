@@ -121,14 +121,33 @@ public class TB_OutboxRelayContext {
         }
     }
 
+    // Text is measured and cut in 16-bit units, and a character outside the Basic Multilingual Plane
+    // takes two: a high surrogate then a low one. A cut between them keeps half a character, which
+    // the platform saves as U+FFFD, so the cut moves by one unit to keep whole characters only. The
+    // stored text can then be one unit under the field length.
+    private static final Integer FIRST_HIGH_SURROGATE = 55296;
+    private static final Integer LAST_HIGH_SURROGATE = 56319;
+    private static final Integer FIRST_LOW_SURROGATE = 56320;
+    private static final Integer LAST_LOW_SURROGATE = 57343;
+
     private static String keepStart(String text, Integer fieldLength) {
         String notice = '\n[Shortened from ' + text.length() + ' characters to fit its field. The end was dropped.]';
-        return text.left(fieldLength - notice.length()) + notice;
+        Integer kept = fieldLength - notice.length();
+        Integer lastKept = text.charAt(kept - 1);
+        if (lastKept >= FIRST_HIGH_SURROGATE && lastKept <= LAST_HIGH_SURROGATE) {
+            kept--;
+        }
+        return text.left(kept) + notice;
     }
 
     private static String keepEnd(String text, Integer fieldLength) {
         String notice = '[Shortened from ' + text.length() + ' characters to fit its field. The start was dropped.]\n';
-        return notice + text.right(fieldLength - notice.length());
+        Integer kept = fieldLength - notice.length();
+        Integer firstKept = text.charAt(text.length() - kept);
+        if (firstKept >= FIRST_LOW_SURROGATE && firstKept <= LAST_LOW_SURROGATE) {
+            kept--;
+        }
+        return notice + text.right(kept);
     }
 
     // will be called by OutboxRelay
