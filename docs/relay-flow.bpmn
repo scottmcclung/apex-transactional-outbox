@@ -1,0 +1,766 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" xmlns:bpmndi="http://www.omg.org/spec/BPMN/20100524/DI" xmlns:dc="http://www.omg.org/spec/DD/20100524/DC" xmlns:di="http://www.omg.org/spec/DD/20100524/DI" id="Definitions_RelayFlow" targetNamespace="http://bpmn.io/schema/bpmn">
+  <bpmn:collaboration id="Collaboration_RelayFlow">
+    <bpmn:participant id="Participant_Enqueue" name="Enqueue relay job" processRef="Process_Enqueue" />
+    <bpmn:participant id="Participant_Queueable1" name="Queueable Transaction 1" processRef="Process_Queueable1" />
+    <bpmn:participant id="Participant_Finalizer1" name="Transaction 1 - Finalizer" processRef="Process_Finalizer1" />
+    <bpmn:participant id="Participant_Queueable2" name="Queueable Transaction 2" processRef="Process_Queueable2" />
+    <bpmn:participant id="Participant_Finalizer2" name="Transaction 2 - Finalizer" processRef="Process_Finalizer2" />
+    <bpmn:messageFlow id="MessageFlow_1" name="Enqueue job" sourceRef="End_Enqueued" targetRef="Start_Run" />
+    <bpmn:messageFlow id="MessageFlow_2" name="Relay response state injected into finalizer" sourceRef="End_Run" targetRef="Start_Fin1" />
+    <bpmn:messageFlow id="MessageFlow_3" sourceRef="End_LimitRun" targetRef="Start_Fin1" />
+    <bpmn:messageFlow id="MessageFlow_4" name="Finalizer state injected into Transaction 2 queueable" sourceRef="End_EnqueueActions" targetRef="Start_Actions" />
+    <bpmn:messageFlow id="MessageFlow_5" name="Enqueue job" sourceRef="End_EnqueueRun1" targetRef="Start_FinalizerAsk" />
+    <bpmn:messageFlow id="MessageFlow_6" sourceRef="End_Actions" targetRef="Start_Fin2" />
+    <bpmn:messageFlow id="MessageFlow_7" sourceRef="End_ActionLimit2" targetRef="Start_Fin2" />
+    <bpmn:messageFlow id="MessageFlow_8" name="Enqueue job" sourceRef="End_EnqueueRun2" targetRef="Start_FinalizerAsk" />
+  </bpmn:collaboration>
+  <bpmn:process id="Process_Enqueue" name="Enqueue relay job" isExecutable="false">
+    <bpmn:startEvent id="Start_Published" name="Message published to outbox"><bpmn:messageEventDefinition id="Start_Published_def" /></bpmn:startEvent>
+    <bpmn:startEvent id="Start_Sweep" name="Scheduled sweep"><bpmn:timerEventDefinition id="Start_Sweep_def" /></bpmn:startEvent>
+    <bpmn:startEvent id="Start_FinalizerAsk" name="Finalizer found more work"><bpmn:messageEventDefinition id="Start_FinalizerAsk_def" /></bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Gw_Guard" name="Relay job already queued or running?" />
+    <bpmn:endEvent id="End_Enqueued" name="Relay job enqueued"><bpmn:messageEventDefinition id="End_Enqueued_def" /></bpmn:endEvent>
+    <bpmn:endEvent id="End_Skipped" name="Enqueue skipped" />
+    <bpmn:sequenceFlow id="Flow_Enqueue_1" sourceRef="Start_Published" targetRef="Gw_Guard" />
+    <bpmn:sequenceFlow id="Flow_Enqueue_2" sourceRef="Start_Sweep" targetRef="Gw_Guard" />
+    <bpmn:sequenceFlow id="Flow_Enqueue_3" sourceRef="Start_FinalizerAsk" targetRef="Gw_Guard" />
+    <bpmn:sequenceFlow id="Flow_Enqueue_4" name="No" sourceRef="Gw_Guard" targetRef="End_Enqueued" />
+    <bpmn:sequenceFlow id="Flow_Enqueue_5" name="Yes" sourceRef="Gw_Guard" targetRef="End_Skipped" />
+  </bpmn:process>
+  <bpmn:process id="Process_Queueable1" name="Queueable Transaction 1" isExecutable="false">
+    <bpmn:startEvent id="Start_Run" name="Relay job starts"><bpmn:messageEventDefinition id="Start_Run_def" /></bpmn:startEvent>
+    <bpmn:task id="Task_Load" name="Load outbox records" />
+    <bpmn:exclusiveGateway id="Gw_AnyDue" name="Any records due?" />
+    <bpmn:endEvent id="End_NothingDue" name="Nothing to relay" />
+    <bpmn:task id="Task_Generate" name="Generate message payloads" />
+    <bpmn:task id="Task_Attach1" name="Attach finalizer" />
+    <bpmn:subProcess id="Task_Send" name="Send messages through relay clients">
+      <bpmn:startEvent id="Send_Start" name="Records ready to send" />
+      <bpmn:task id="Send_TaskTake" name="Take the next outbox record" />
+      <bpmn:exclusiveGateway id="Send_GwTurn" name="Can this record be sent now?" />
+      <bpmn:exclusiveGateway id="Send_GwRoom" name="Does the declared cost of this send fit in the platform limits the run has left?" />
+      <bpmn:task id="Send_TaskSend" name="Send through the relay client" />
+      <bpmn:exclusiveGateway id="Send_GwEnded" name="Relay client response?" />
+      <bpmn:task id="Send_TaskDelivered" name="Record delivered outcome" />
+      <bpmn:task id="Send_TaskFailed" name="Record failed outcome" />
+      <bpmn:task id="Send_TaskAbandon" name="Undo the attempt count and record it as abandoned" />
+      <bpmn:endEvent id="Send_EndStopped" name="Sending ends, no more records processed" />
+      <bpmn:task id="Send_TaskLeave" name="Leave the record unsent" />
+      <bpmn:task id="Send_TaskNoConfig" name="Record failed attempt for missing configuration" />
+      <bpmn:exclusiveGateway id="Send_GwMore" name="More records?" />
+      <bpmn:endEvent id="Send_EndDone" name="All records processed" />
+      <bpmn:boundaryEvent id="Send_BoundaryLimit" name="Uncatchable platform exception" attachedToRef="Send_TaskSend"><bpmn:errorEventDefinition id="Send_BoundaryLimit_def" /></bpmn:boundaryEvent>
+      <bpmn:endEvent id="Send_EndLimit" name="Platform ends the run"><bpmn:errorEventDefinition id="Send_EndLimit_def" /></bpmn:endEvent>
+      <bpmn:sequenceFlow id="Flow_Task_Send_1" sourceRef="Send_Start" targetRef="Send_TaskTake" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_2" sourceRef="Send_TaskTake" targetRef="Send_GwTurn" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_3" name="Yes" sourceRef="Send_GwTurn" targetRef="Send_GwRoom" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_4" name="No, it waits" sourceRef="Send_GwTurn" targetRef="Send_GwMore" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_5" name="No, its configuration is missing" sourceRef="Send_GwTurn" targetRef="Send_TaskNoConfig" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_6" name="Yes" sourceRef="Send_GwRoom" targetRef="Send_TaskSend" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_7" name="No" sourceRef="Send_GwRoom" targetRef="Send_TaskLeave" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_8" sourceRef="Send_TaskSend" targetRef="Send_GwEnded" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_9" name="Success" sourceRef="Send_GwEnded" targetRef="Send_TaskDelivered" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_10" name="Record failure" sourceRef="Send_GwEnded" targetRef="Send_TaskFailed" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_11" name="Process failure" sourceRef="Send_GwEnded" targetRef="Send_TaskAbandon" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_12" sourceRef="Send_TaskAbandon" targetRef="Send_EndStopped" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_13" sourceRef="Send_TaskDelivered" targetRef="Send_GwMore" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_14" sourceRef="Send_TaskFailed" targetRef="Send_GwMore" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_15" sourceRef="Send_TaskLeave" targetRef="Send_GwMore" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_16" sourceRef="Send_TaskNoConfig" targetRef="Send_GwMore" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_17" name="No" sourceRef="Send_GwMore" targetRef="Send_EndDone" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_18" name="Yes" sourceRef="Send_GwMore" targetRef="Send_TaskTake" />
+      <bpmn:sequenceFlow id="Flow_Task_Send_19" sourceRef="Send_BoundaryLimit" targetRef="Send_EndLimit" />
+      <bpmn:textAnnotation id="Send_NoteWaits"><bpmn:text>A record waits when an earlier message with the same group id is undelivered, or when its subscription is isolated and the run has already made an attempt.</bpmn:text></bpmn:textAnnotation>
+      <bpmn:association id="Send_NoteWaits_link" sourceRef="Send_GwTurn" targetRef="Send_NoteWaits" />
+      <bpmn:textAnnotation id="Send_NoteFirst"><bpmn:text>The relay client declares what one send needs of each platform limit, such as callouts, callout time, queries, DML, CPU time and heap. The run compares that with what it has left of each. Its first attempt is not checked.</bpmn:text></bpmn:textAnnotation>
+      <bpmn:association id="Send_NoteFirst_link" sourceRef="Send_GwRoom" targetRef="Send_NoteFirst" />
+      <bpmn:textAnnotation id="Send_NoteRaise"><bpmn:text>The relay client returns one of three responses, built with what the framework gives it, and a message that is logged. The framework acts on the response and does not judge the reason. Success and record failure count the attempt, and sending continues. Process failure does not count the attempt, and sending ends. For example, the HTTP client returns a record failure when the subscriber answers with a status above 300.</bpmn:text></bpmn:textAnnotation>
+      <bpmn:association id="Send_NoteRaise_link" sourceRef="Send_GwEnded" targetRef="Send_NoteRaise" />
+      <bpmn:textAnnotation id="Send_NoteLeave"><bpmn:text>The record remains undelivered and causes any subsequent messages with the same group id to wait.</bpmn:text></bpmn:textAnnotation>
+      <bpmn:association id="Send_NoteLeave_link" sourceRef="Send_TaskLeave" targetRef="Send_NoteLeave" />
+      <bpmn:textAnnotation id="Send_NoteFailed"><bpmn:text>A failed send causes any subsequent messages with the same group id to wait.</bpmn:text></bpmn:textAnnotation>
+      <bpmn:association id="Send_NoteFailed_link" sourceRef="Send_TaskFailed" targetRef="Send_NoteFailed" />
+    </bpmn:subProcess>
+    <bpmn:task id="Task_Save1" name="Save outcomes to outbox records" />
+    <bpmn:endEvent id="End_Run" name="Run ends"><bpmn:messageEventDefinition id="End_Run_def" /></bpmn:endEvent>
+    <bpmn:boundaryEvent id="Boundary_Limit" name="Uncatchable platform exception" attachedToRef="Task_Send"><bpmn:errorEventDefinition id="Boundary_Limit_def" /></bpmn:boundaryEvent>
+    <bpmn:endEvent id="End_LimitRun" name="Run ended by the platform"><bpmn:messageEventDefinition id="End_LimitRun_def" /></bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_Queueable1_1" sourceRef="Start_Run" targetRef="Task_Load" />
+    <bpmn:sequenceFlow id="Flow_Queueable1_2" sourceRef="Task_Load" targetRef="Gw_AnyDue" />
+    <bpmn:sequenceFlow id="Flow_Queueable1_3" name="Yes" sourceRef="Gw_AnyDue" targetRef="Task_Generate" />
+    <bpmn:sequenceFlow id="Flow_Queueable1_4" name="No" sourceRef="Gw_AnyDue" targetRef="End_NothingDue" />
+    <bpmn:sequenceFlow id="Flow_Queueable1_5" sourceRef="Task_Generate" targetRef="Task_Attach1" />
+    <bpmn:sequenceFlow id="Flow_Queueable1_6" sourceRef="Task_Attach1" targetRef="Task_Send" />
+    <bpmn:sequenceFlow id="Flow_Queueable1_7" sourceRef="Task_Send" targetRef="Task_Save1" />
+    <bpmn:sequenceFlow id="Flow_Queueable1_8" sourceRef="Task_Save1" targetRef="End_Run" />
+    <bpmn:sequenceFlow id="Flow_Queueable1_9" sourceRef="Boundary_Limit" targetRef="End_LimitRun" />
+    <bpmn:textAnnotation id="Note_LimitRun"><bpmn:text>The finalizer still runs. Its save is then the first save of these outcomes.</bpmn:text></bpmn:textAnnotation>
+    <bpmn:association id="Note_LimitRun_link" sourceRef="End_LimitRun" targetRef="Note_LimitRun" />
+  </bpmn:process>
+  <bpmn:process id="Process_Finalizer1" name="Transaction 1 - Finalizer" isExecutable="false">
+    <bpmn:startEvent id="Start_Fin1" name="Finalizer starts"><bpmn:messageEventDefinition id="Start_Fin1_def" /></bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Gw_Saved" name="Outcome save successful?" />
+    <bpmn:task id="Task_Save2" name="Save outcomes to outbox records" />
+    <bpmn:exclusiveGateway id="Gw_ActionsAfterResave" name="After relay actions to run?" />
+    <bpmn:endEvent id="End_EnqueueActions" name="Enqueue after-relay job"><bpmn:messageEventDefinition id="End_EnqueueActions_def" /></bpmn:endEvent>
+    <bpmn:exclusiveGateway id="Gw_Actions" name="After relay actions to run?" />
+    <bpmn:task id="Task_RunActions1" name="Run after relay actions" />
+    <bpmn:exclusiveGateway id="Gw_Empty1" name="Outbox empty?" />
+    <bpmn:endEvent id="End_Done1" name="End" />
+    <bpmn:endEvent id="End_EnqueueRun1" name="Enqueue relay job"><bpmn:messageEventDefinition id="End_EnqueueRun1_def" /></bpmn:endEvent>
+    <bpmn:boundaryEvent id="Boundary_ActionLimit" name="Uncatchable platform exception" attachedToRef="Task_RunActions1"><bpmn:errorEventDefinition id="Boundary_ActionLimit_def" /></bpmn:boundaryEvent>
+    <bpmn:endEvent id="End_ActionLimit" name="No next run queued"><bpmn:errorEventDefinition id="End_ActionLimit_def" /></bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_Finalizer1_1" sourceRef="Start_Fin1" targetRef="Gw_Saved" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_2" name="No" sourceRef="Gw_Saved" targetRef="Task_Save2" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_3" name="Yes" sourceRef="Gw_Saved" targetRef="Gw_Actions" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_4" sourceRef="Task_Save2" targetRef="Gw_ActionsAfterResave" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_5" name="Yes" sourceRef="Gw_ActionsAfterResave" targetRef="End_EnqueueActions" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_6" name="No" sourceRef="Gw_ActionsAfterResave" targetRef="Gw_Empty1" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_7" name="Yes" sourceRef="Gw_Actions" targetRef="Task_RunActions1" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_8" name="No" sourceRef="Gw_Actions" targetRef="Gw_Empty1" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_9" sourceRef="Task_RunActions1" targetRef="Gw_Empty1" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_10" name="Yes" sourceRef="Gw_Empty1" targetRef="End_Done1" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_11" name="No" sourceRef="Gw_Empty1" targetRef="End_EnqueueRun1" />
+    <bpmn:sequenceFlow id="Flow_Finalizer1_12" sourceRef="Boundary_ActionLimit" targetRef="End_ActionLimit" />
+    <bpmn:textAnnotation id="Note_SecondSave"><bpmn:text>A row rejected a second time stays due. Later runs send it again. Its outcome still goes to the action, marked as not stored.</bpmn:text></bpmn:textAnnotation>
+    <bpmn:association id="Note_SecondSave_link" sourceRef="Task_Save2" targetRef="Note_SecondSave" />
+    <bpmn:textAnnotation id="Note_Stored1"><bpmn:text>Each outcome says whether it was stored.</bpmn:text></bpmn:textAnnotation>
+    <bpmn:association id="Note_Stored1_link" sourceRef="Task_RunActions1" targetRef="Note_Stored1" />
+    <bpmn:textAnnotation id="Note_Sweep"><bpmn:text>The scheduled sweep picks up the remaining work.</bpmn:text></bpmn:textAnnotation>
+    <bpmn:association id="Note_Sweep_link" sourceRef="End_ActionLimit" targetRef="Note_Sweep" />
+  </bpmn:process>
+  <bpmn:process id="Process_Queueable2" name="Queueable Transaction 2" isExecutable="false">
+    <bpmn:startEvent id="Start_Actions" name="After-relay job starts"><bpmn:messageEventDefinition id="Start_Actions_def" /></bpmn:startEvent>
+    <bpmn:task id="Task_Attach2" name="Attach finalizer" />
+    <bpmn:task id="Task_RunActions2" name="Run after relay actions" />
+    <bpmn:endEvent id="End_Actions" name="Job ends"><bpmn:messageEventDefinition id="End_Actions_def" /></bpmn:endEvent>
+    <bpmn:boundaryEvent id="Boundary_ActionLimit2" name="Uncatchable platform exception" attachedToRef="Task_RunActions2"><bpmn:errorEventDefinition id="Boundary_ActionLimit2_def" /></bpmn:boundaryEvent>
+    <bpmn:endEvent id="End_ActionLimit2" name="After relay actions not run"><bpmn:messageEventDefinition id="End_ActionLimit2_def" /></bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_Queueable2_1" sourceRef="Start_Actions" targetRef="Task_Attach2" />
+    <bpmn:sequenceFlow id="Flow_Queueable2_2" sourceRef="Task_Attach2" targetRef="Task_RunActions2" />
+    <bpmn:sequenceFlow id="Flow_Queueable2_3" sourceRef="Task_RunActions2" targetRef="End_Actions" />
+    <bpmn:sequenceFlow id="Flow_Queueable2_4" sourceRef="Boundary_ActionLimit2" targetRef="End_ActionLimit2" />
+    <bpmn:textAnnotation id="Note_Stored2"><bpmn:text>Each outcome says whether it was stored. An outcome that is not stored is still passed.</bpmn:text></bpmn:textAnnotation>
+    <bpmn:association id="Note_Stored2_link" sourceRef="Task_RunActions2" targetRef="Note_Stored2" />
+  </bpmn:process>
+  <bpmn:process id="Process_Finalizer2" name="Transaction 2 - Finalizer" isExecutable="false">
+    <bpmn:startEvent id="Start_Fin2" name="Finalizer starts"><bpmn:messageEventDefinition id="Start_Fin2_def" /></bpmn:startEvent>
+    <bpmn:exclusiveGateway id="Gw_Empty2" name="Outbox empty?" />
+    <bpmn:endEvent id="End_Done2" name="End" />
+    <bpmn:endEvent id="End_EnqueueRun2" name="Enqueue relay job"><bpmn:messageEventDefinition id="End_EnqueueRun2_def" /></bpmn:endEvent>
+    <bpmn:sequenceFlow id="Flow_Finalizer2_1" sourceRef="Start_Fin2" targetRef="Gw_Empty2" />
+    <bpmn:sequenceFlow id="Flow_Finalizer2_2" name="Yes" sourceRef="Gw_Empty2" targetRef="End_Done2" />
+    <bpmn:sequenceFlow id="Flow_Finalizer2_3" name="No" sourceRef="Gw_Empty2" targetRef="End_EnqueueRun2" />
+  </bpmn:process>
+  <bpmndi:BPMNDiagram id="Diagram_RelayFlow">
+    <bpmndi:BPMNPlane id="Plane_RelayFlow" bpmnElement="Collaboration_RelayFlow">
+      <bpmndi:BPMNShape id="Participant_Enqueue_di" bpmnElement="Participant_Enqueue" isHorizontal="true">
+        <dc:Bounds x="160" y="80" width="1240" height="300" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Start_Published_di" bpmnElement="Start_Published">
+        <dc:Bounds x="232" y="132" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="200" y="172" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Start_Sweep_di" bpmnElement="Start_Sweep">
+        <dc:Bounds x="232" y="212" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="200" y="252" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Start_FinalizerAsk_di" bpmnElement="Start_FinalizerAsk">
+        <dc:Bounds x="232" y="292" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="200" y="332" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Guard_di" bpmnElement="Gw_Guard" isMarkerVisible="true">
+        <dc:Bounds x="395" y="205" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="355" y="165" width="130" height="40" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Enqueued_di" bpmnElement="End_Enqueued">
+        <dc:Bounds x="582" y="212" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="625" y="217" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Skipped_di" bpmnElement="End_Skipped">
+        <dc:Bounds x="502" y="302" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="470" y="342" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Participant_Queueable1_di" bpmnElement="Participant_Queueable1" isHorizontal="true">
+        <dc:Bounds x="160" y="450" width="1240" height="330" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Start_Run_di" bpmnElement="Start_Run">
+        <dc:Bounds x="242" y="522" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="210" y="562" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Load_di" bpmnElement="Task_Load">
+        <dc:Bounds x="330" y="500" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_AnyDue_di" bpmnElement="Gw_AnyDue" isMarkerVisible="true">
+        <dc:Bounds x="475" y="515" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="455" y="487" width="90" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_NothingDue_di" bpmnElement="End_NothingDue">
+        <dc:Bounds x="482" y="672" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="450" y="712" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Generate_di" bpmnElement="Task_Generate">
+        <dc:Bounds x="580" y="500" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Attach1_di" bpmnElement="Task_Attach1">
+        <dc:Bounds x="730" y="500" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Send_di" bpmnElement="Task_Send" isExpanded="false">
+        <dc:Bounds x="865" y="500" width="130" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Save1_di" bpmnElement="Task_Save1">
+        <dc:Bounds x="1030" y="500" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Run_di" bpmnElement="End_Run">
+        <dc:Bounds x="1192" y="522" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1180" y="500" width="60" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Boundary_Limit_di" bpmnElement="Boundary_Limit">
+        <dc:Bounds x="957" y="562" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="848" y="594" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_LimitRun_di" bpmnElement="End_LimitRun">
+        <dc:Bounds x="957" y="672" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="865" y="677" width="75" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Note_LimitRun_di" bpmnElement="Note_LimitRun">
+        <dc:Bounds x="1035" y="662" width="165" height="56" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Participant_Finalizer1_di" bpmnElement="Participant_Finalizer1" isHorizontal="true">
+        <dc:Bounds x="160" y="850" width="1240" height="600" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Start_Fin1_di" bpmnElement="Start_Fin1">
+        <dc:Bounds x="242" y="1002" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="210" y="1042" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Saved_di" bpmnElement="Gw_Saved" isMarkerVisible="true">
+        <dc:Bounds x="355" y="995" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="335" y="962" width="90" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Save2_di" bpmnElement="Task_Save2">
+        <dc:Bounds x="570" y="980" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_ActionsAfterResave_di" bpmnElement="Gw_ActionsAfterResave" isMarkerVisible="true">
+        <dc:Bounds x="835" y="995" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="815" y="962" width="90" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_EnqueueActions_di" bpmnElement="End_EnqueueActions">
+        <dc:Bounds x="1002" y="1002" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="970" y="1042" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Actions_di" bpmnElement="Gw_Actions" isMarkerVisible="true">
+        <dc:Bounds x="355" y="1185" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="250" y="1196" width="95" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_RunActions1_di" bpmnElement="Task_RunActions1">
+        <dc:Bounds x="570" y="1170" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Empty1_di" bpmnElement="Gw_Empty1" isMarkerVisible="true">
+        <dc:Bounds x="975" y="1185" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="960" y="1162" width="80" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Done1_di" bpmnElement="End_Done1">
+        <dc:Bounds x="1122" y="1192" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1090" y="1232" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_EnqueueRun1_di" bpmnElement="End_EnqueueRun1">
+        <dc:Bounds x="982" y="1332" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1025" y="1343" width="100" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Boundary_ActionLimit_di" bpmnElement="Boundary_ActionLimit">
+        <dc:Bounds x="622" y="1232" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="665" y="1260" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_ActionLimit_di" bpmnElement="End_ActionLimit">
+        <dc:Bounds x="622" y="1312" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="590" y="1352" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Note_SecondSave_di" bpmnElement="Note_SecondSave">
+        <dc:Bounds x="500" y="870" width="250" height="58" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Note_Stored1_di" bpmnElement="Note_Stored1">
+        <dc:Bounds x="670" y="1095" width="160" height="42" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Note_Sweep_di" bpmnElement="Note_Sweep">
+        <dc:Bounds x="415" y="1305" width="160" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Participant_Queueable2_di" bpmnElement="Participant_Queueable2" isHorizontal="true">
+        <dc:Bounds x="160" y="1520" width="1240" height="310" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Start_Actions_di" bpmnElement="Start_Actions">
+        <dc:Bounds x="242" y="1632" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="210" y="1672" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_Attach2_di" bpmnElement="Task_Attach2">
+        <dc:Bounds x="330" y="1610" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Task_RunActions2_di" bpmnElement="Task_RunActions2">
+        <dc:Bounds x="480" y="1610" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Actions_di" bpmnElement="End_Actions">
+        <dc:Bounds x="642" y="1632" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="685" y="1643" width="60" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Boundary_ActionLimit2_di" bpmnElement="Boundary_ActionLimit2">
+        <dc:Bounds x="532" y="1672" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="430" y="1700" width="95" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_ActionLimit2_di" bpmnElement="End_ActionLimit2">
+        <dc:Bounds x="532" y="1752" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="430" y="1757" width="95" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Note_Stored2_di" bpmnElement="Note_Stored2">
+        <dc:Bounds x="610" y="1535" width="220" height="50" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Participant_Finalizer2_di" bpmnElement="Participant_Finalizer2" isHorizontal="true">
+        <dc:Bounds x="160" y="1900" width="1240" height="260" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Start_Fin2_di" bpmnElement="Start_Fin2">
+        <dc:Bounds x="242" y="1972" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="210" y="2012" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Gw_Empty2_di" bpmnElement="Gw_Empty2" isMarkerVisible="true">
+        <dc:Bounds x="375" y="1965" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="360" y="1942" width="80" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_Done2_di" bpmnElement="End_Done2">
+        <dc:Bounds x="522" y="1972" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="490" y="2012" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="End_EnqueueRun2_di" bpmnElement="End_EnqueueRun2">
+        <dc:Bounds x="382" y="2072" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="425" y="2083" width="100" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="MessageFlow_1_di" bpmnElement="MessageFlow_1">
+        <di:waypoint x="600" y="248" />
+        <di:waypoint x="600" y="420" />
+        <di:waypoint x="260" y="420" />
+        <di:waypoint x="260" y="522" />
+        <bpmndi:BPMNLabel><dc:Bounds x="395" y="401" width="70" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MessageFlow_2_di" bpmnElement="MessageFlow_2">
+        <di:waypoint x="1210" y="558" />
+        <di:waypoint x="1210" y="815" />
+        <di:waypoint x="260" y="815" />
+        <di:waypoint x="260" y="1002" />
+        <bpmndi:BPMNLabel><dc:Bounds x="490" y="796" width="240" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MessageFlow_3_di" bpmnElement="MessageFlow_3">
+        <di:waypoint x="975" y="708" />
+        <di:waypoint x="975" y="815" />
+        <di:waypoint x="260" y="815" />
+        <di:waypoint x="260" y="1002" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MessageFlow_4_di" bpmnElement="MessageFlow_4">
+        <di:waypoint x="1038" y="1020" />
+        <di:waypoint x="1240" y="1020" />
+        <di:waypoint x="1240" y="1495" />
+        <di:waypoint x="260" y="1495" />
+        <di:waypoint x="260" y="1632" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1252" y="1230" width="140" height="40" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MessageFlow_5_di" bpmnElement="MessageFlow_5">
+        <di:waypoint x="1000" y="1368" />
+        <di:waypoint x="1000" y="1475" />
+        <di:waypoint x="120" y="1475" />
+        <di:waypoint x="120" y="310" />
+        <di:waypoint x="232" y="310" />
+        <bpmndi:BPMNLabel><dc:Bounds x="465" y="1456" width="70" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MessageFlow_6_di" bpmnElement="MessageFlow_6">
+        <di:waypoint x="660" y="1668" />
+        <di:waypoint x="660" y="1865" />
+        <di:waypoint x="260" y="1865" />
+        <di:waypoint x="260" y="1972" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MessageFlow_7_di" bpmnElement="MessageFlow_7">
+        <di:waypoint x="550" y="1788" />
+        <di:waypoint x="550" y="1865" />
+        <di:waypoint x="260" y="1865" />
+        <di:waypoint x="260" y="1972" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="MessageFlow_8_di" bpmnElement="MessageFlow_8">
+        <di:waypoint x="400" y="2108" />
+        <di:waypoint x="400" y="2180" />
+        <di:waypoint x="100" y="2180" />
+        <di:waypoint x="100" y="310" />
+        <di:waypoint x="232" y="310" />
+        <bpmndi:BPMNLabel><dc:Bounds x="215" y="2161" width="70" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Enqueue_1_di" bpmnElement="Flow_Enqueue_1">
+        <di:waypoint x="268" y="150" />
+        <di:waypoint x="340" y="150" />
+        <di:waypoint x="340" y="230" />
+        <di:waypoint x="395" y="230" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Enqueue_2_di" bpmnElement="Flow_Enqueue_2">
+        <di:waypoint x="268" y="230" />
+        <di:waypoint x="395" y="230" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Enqueue_3_di" bpmnElement="Flow_Enqueue_3">
+        <di:waypoint x="268" y="310" />
+        <di:waypoint x="340" y="310" />
+        <di:waypoint x="340" y="230" />
+        <di:waypoint x="395" y="230" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Enqueue_4_di" bpmnElement="Flow_Enqueue_4">
+        <di:waypoint x="445" y="230" />
+        <di:waypoint x="582" y="230" />
+        <bpmndi:BPMNLabel><dc:Bounds x="453" y="212" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Enqueue_5_di" bpmnElement="Flow_Enqueue_5">
+        <di:waypoint x="420" y="255" />
+        <di:waypoint x="420" y="320" />
+        <di:waypoint x="502" y="320" />
+        <bpmndi:BPMNLabel><dc:Bounds x="426" y="261" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_1_di" bpmnElement="Flow_Queueable1_1">
+        <di:waypoint x="278" y="540" />
+        <di:waypoint x="330" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_2_di" bpmnElement="Flow_Queueable1_2">
+        <di:waypoint x="430" y="540" />
+        <di:waypoint x="475" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_3_di" bpmnElement="Flow_Queueable1_3">
+        <di:waypoint x="525" y="540" />
+        <di:waypoint x="580" y="540" />
+        <bpmndi:BPMNLabel><dc:Bounds x="533" y="522" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_4_di" bpmnElement="Flow_Queueable1_4">
+        <di:waypoint x="500" y="565" />
+        <di:waypoint x="500" y="672" />
+        <bpmndi:BPMNLabel><dc:Bounds x="506" y="571" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_5_di" bpmnElement="Flow_Queueable1_5">
+        <di:waypoint x="680" y="540" />
+        <di:waypoint x="730" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_6_di" bpmnElement="Flow_Queueable1_6">
+        <di:waypoint x="830" y="540" />
+        <di:waypoint x="865" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_7_di" bpmnElement="Flow_Queueable1_7">
+        <di:waypoint x="995" y="540" />
+        <di:waypoint x="1030" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_8_di" bpmnElement="Flow_Queueable1_8">
+        <di:waypoint x="1130" y="540" />
+        <di:waypoint x="1192" y="540" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable1_9_di" bpmnElement="Flow_Queueable1_9">
+        <di:waypoint x="975" y="598" />
+        <di:waypoint x="975" y="672" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Note_LimitRun_link_di" bpmnElement="Note_LimitRun_link">
+        <di:waypoint x="993" y="690" />
+        <di:waypoint x="1035" y="690" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_1_di" bpmnElement="Flow_Finalizer1_1">
+        <di:waypoint x="278" y="1020" />
+        <di:waypoint x="355" y="1020" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_2_di" bpmnElement="Flow_Finalizer1_2">
+        <di:waypoint x="405" y="1020" />
+        <di:waypoint x="570" y="1020" />
+        <bpmndi:BPMNLabel><dc:Bounds x="413" y="1002" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_3_di" bpmnElement="Flow_Finalizer1_3">
+        <di:waypoint x="380" y="1045" />
+        <di:waypoint x="380" y="1185" />
+        <bpmndi:BPMNLabel><dc:Bounds x="386" y="1051" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_4_di" bpmnElement="Flow_Finalizer1_4">
+        <di:waypoint x="670" y="1020" />
+        <di:waypoint x="835" y="1020" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_5_di" bpmnElement="Flow_Finalizer1_5">
+        <di:waypoint x="885" y="1020" />
+        <di:waypoint x="1002" y="1020" />
+        <bpmndi:BPMNLabel><dc:Bounds x="893" y="1002" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_6_di" bpmnElement="Flow_Finalizer1_6">
+        <di:waypoint x="860" y="1045" />
+        <di:waypoint x="860" y="1210" />
+        <di:waypoint x="975" y="1210" />
+        <bpmndi:BPMNLabel><dc:Bounds x="866" y="1051" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_7_di" bpmnElement="Flow_Finalizer1_7">
+        <di:waypoint x="405" y="1210" />
+        <di:waypoint x="570" y="1210" />
+        <bpmndi:BPMNLabel><dc:Bounds x="413" y="1192" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_8_di" bpmnElement="Flow_Finalizer1_8">
+        <di:waypoint x="380" y="1235" />
+        <di:waypoint x="380" y="1405" />
+        <di:waypoint x="860" y="1405" />
+        <di:waypoint x="860" y="1210" />
+        <di:waypoint x="975" y="1210" />
+        <bpmndi:BPMNLabel><dc:Bounds x="386" y="1241" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_9_di" bpmnElement="Flow_Finalizer1_9">
+        <di:waypoint x="670" y="1210" />
+        <di:waypoint x="975" y="1210" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_10_di" bpmnElement="Flow_Finalizer1_10">
+        <di:waypoint x="1025" y="1210" />
+        <di:waypoint x="1122" y="1210" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1033" y="1192" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_11_di" bpmnElement="Flow_Finalizer1_11">
+        <di:waypoint x="1000" y="1235" />
+        <di:waypoint x="1000" y="1332" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1006" y="1241" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer1_12_di" bpmnElement="Flow_Finalizer1_12">
+        <di:waypoint x="640" y="1268" />
+        <di:waypoint x="640" y="1312" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Note_SecondSave_link_di" bpmnElement="Note_SecondSave_link">
+        <di:waypoint x="620" y="980" />
+        <di:waypoint x="620" y="928" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Note_Stored1_link_di" bpmnElement="Note_Stored1_link">
+        <di:waypoint x="650" y="1170" />
+        <di:waypoint x="675" y="1137" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Note_Sweep_link_di" bpmnElement="Note_Sweep_link">
+        <di:waypoint x="622" y="1330" />
+        <di:waypoint x="575" y="1330" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable2_1_di" bpmnElement="Flow_Queueable2_1">
+        <di:waypoint x="278" y="1650" />
+        <di:waypoint x="330" y="1650" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable2_2_di" bpmnElement="Flow_Queueable2_2">
+        <di:waypoint x="430" y="1650" />
+        <di:waypoint x="480" y="1650" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable2_3_di" bpmnElement="Flow_Queueable2_3">
+        <di:waypoint x="580" y="1650" />
+        <di:waypoint x="642" y="1650" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Queueable2_4_di" bpmnElement="Flow_Queueable2_4">
+        <di:waypoint x="550" y="1708" />
+        <di:waypoint x="550" y="1752" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Note_Stored2_link_di" bpmnElement="Note_Stored2_link">
+        <di:waypoint x="565" y="1610" />
+        <di:waypoint x="610" y="1582" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer2_1_di" bpmnElement="Flow_Finalizer2_1">
+        <di:waypoint x="278" y="1990" />
+        <di:waypoint x="375" y="1990" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer2_2_di" bpmnElement="Flow_Finalizer2_2">
+        <di:waypoint x="425" y="1990" />
+        <di:waypoint x="522" y="1990" />
+        <bpmndi:BPMNLabel><dc:Bounds x="433" y="1972" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Finalizer2_3_di" bpmnElement="Flow_Finalizer2_3">
+        <di:waypoint x="400" y="2015" />
+        <di:waypoint x="400" y="2072" />
+        <bpmndi:BPMNLabel><dc:Bounds x="406" y="2021" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+  <bpmndi:BPMNDiagram id="Diagram_Task_Send">
+    <bpmndi:BPMNPlane id="Plane_Task_Send" bpmnElement="Task_Send">
+      <bpmndi:BPMNShape id="Send_Start_di" bpmnElement="Send_Start">
+        <dc:Bounds x="82" y="382" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="50" y="422" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_TaskTake_di" bpmnElement="Send_TaskTake">
+        <dc:Bounds x="230" y="360" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_GwTurn_di" bpmnElement="Send_GwTurn" isMarkerVisible="true">
+        <dc:Bounds x="445" y="375" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="368" y="348" width="90" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_GwRoom_di" bpmnElement="Send_GwRoom" isMarkerVisible="true">
+        <dc:Bounds x="735" y="375" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="685" y="318" width="150" height="40" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_TaskSend_di" bpmnElement="Send_TaskSend">
+        <dc:Bounds x="960" y="360" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_GwEnded_di" bpmnElement="Send_GwEnded" isMarkerVisible="true">
+        <dc:Bounds x="1235" y="375" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1150" y="344" width="95" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_TaskDelivered_di" bpmnElement="Send_TaskDelivered">
+        <dc:Bounds x="1450" y="360" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_TaskFailed_di" bpmnElement="Send_TaskFailed">
+        <dc:Bounds x="1450" y="540" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_TaskAbandon_di" bpmnElement="Send_TaskAbandon">
+        <dc:Bounds x="1445" y="160" width="130" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_EndStopped_di" bpmnElement="Send_EndStopped">
+        <dc:Bounds x="1642" y="182" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1600" y="224" width="120" height="40" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_TaskLeave_di" bpmnElement="Send_TaskLeave">
+        <dc:Bounds x="960" y="720" width="100" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_TaskNoConfig_di" bpmnElement="Send_TaskNoConfig">
+        <dc:Bounds x="945" y="900" width="130" height="80" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_GwMore_di" bpmnElement="Send_GwMore" isMarkerVisible="true">
+        <dc:Bounds x="1875" y="375" width="50" height="50" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1860" y="352" width="80" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_EndDone_di" bpmnElement="Send_EndDone">
+        <dc:Bounds x="2022" y="382" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1990" y="422" width="100" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_BoundaryLimit_di" bpmnElement="Send_BoundaryLimit">
+        <dc:Bounds x="1012" y="342" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="900" y="318" width="105" height="27" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_EndLimit_di" bpmnElement="Send_EndLimit">
+        <dc:Bounds x="1012" y="182" width="36" height="36" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1058" y="193" width="120" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_NoteWaits_di" bpmnElement="Send_NoteWaits">
+        <dc:Bounds x="510" y="110" width="240" height="76" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_NoteFirst_di" bpmnElement="Send_NoteFirst">
+        <dc:Bounds x="520" y="480" width="200" height="120" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_NoteRaise_di" bpmnElement="Send_NoteRaise">
+        <dc:Bounds x="1005" y="490" width="235" height="190" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_NoteLeave_di" bpmnElement="Send_NoteLeave">
+        <dc:Bounds x="1110" y="810" width="240" height="56" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNShape id="Send_NoteFailed_di" bpmnElement="Send_NoteFailed">
+        <dc:Bounds x="1450" y="655" width="210" height="58" />
+      </bpmndi:BPMNShape>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_1_di" bpmnElement="Flow_Task_Send_1">
+        <di:waypoint x="118" y="400" />
+        <di:waypoint x="230" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_2_di" bpmnElement="Flow_Task_Send_2">
+        <di:waypoint x="330" y="400" />
+        <di:waypoint x="445" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_3_di" bpmnElement="Flow_Task_Send_3">
+        <di:waypoint x="495" y="400" />
+        <di:waypoint x="735" y="400" />
+        <bpmndi:BPMNLabel><dc:Bounds x="503" y="382" width="25" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_4_di" bpmnElement="Flow_Task_Send_4">
+        <di:waypoint x="470" y="375" />
+        <di:waypoint x="470" y="60" />
+        <di:waypoint x="1760" y="60" />
+        <di:waypoint x="1760" y="400" />
+        <di:waypoint x="1875" y="400" />
+        <bpmndi:BPMNLabel><dc:Bounds x="480" y="66" width="80" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_5_di" bpmnElement="Flow_Task_Send_5">
+        <di:waypoint x="470" y="425" />
+        <di:waypoint x="470" y="940" />
+        <di:waypoint x="945" y="940" />
+        <bpmndi:BPMNLabel><dc:Bounds x="480" y="920" width="170" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_6_di" bpmnElement="Flow_Task_Send_6">
+        <di:waypoint x="785" y="400" />
+        <di:waypoint x="960" y="400" />
+        <bpmndi:BPMNLabel><dc:Bounds x="793" y="382" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_7_di" bpmnElement="Flow_Task_Send_7">
+        <di:waypoint x="760" y="425" />
+        <di:waypoint x="760" y="760" />
+        <di:waypoint x="960" y="760" />
+        <bpmndi:BPMNLabel><dc:Bounds x="766" y="431" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_8_di" bpmnElement="Flow_Task_Send_8">
+        <di:waypoint x="1060" y="400" />
+        <di:waypoint x="1235" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_9_di" bpmnElement="Flow_Task_Send_9">
+        <di:waypoint x="1285" y="400" />
+        <di:waypoint x="1450" y="400" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1293" y="382" width="50" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_10_di" bpmnElement="Flow_Task_Send_10">
+        <di:waypoint x="1260" y="425" />
+        <di:waypoint x="1260" y="580" />
+        <di:waypoint x="1450" y="580" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1268" y="431" width="80" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_11_di" bpmnElement="Flow_Task_Send_11">
+        <di:waypoint x="1260" y="375" />
+        <di:waypoint x="1260" y="200" />
+        <di:waypoint x="1445" y="200" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1272" y="180" width="130" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_12_di" bpmnElement="Flow_Task_Send_12">
+        <di:waypoint x="1575" y="200" />
+        <di:waypoint x="1642" y="200" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_13_di" bpmnElement="Flow_Task_Send_13">
+        <di:waypoint x="1550" y="400" />
+        <di:waypoint x="1875" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_14_di" bpmnElement="Flow_Task_Send_14">
+        <di:waypoint x="1550" y="580" />
+        <di:waypoint x="1760" y="580" />
+        <di:waypoint x="1760" y="400" />
+        <di:waypoint x="1875" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_15_di" bpmnElement="Flow_Task_Send_15">
+        <di:waypoint x="1060" y="760" />
+        <di:waypoint x="1760" y="760" />
+        <di:waypoint x="1760" y="400" />
+        <di:waypoint x="1875" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_16_di" bpmnElement="Flow_Task_Send_16">
+        <di:waypoint x="1075" y="940" />
+        <di:waypoint x="1760" y="940" />
+        <di:waypoint x="1760" y="400" />
+        <di:waypoint x="1875" y="400" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_17_di" bpmnElement="Flow_Task_Send_17">
+        <di:waypoint x="1925" y="400" />
+        <di:waypoint x="2022" y="400" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1933" y="382" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_18_di" bpmnElement="Flow_Task_Send_18">
+        <di:waypoint x="1900" y="425" />
+        <di:waypoint x="1900" y="1060" />
+        <di:waypoint x="180" y="1060" />
+        <di:waypoint x="180" y="400" />
+        <di:waypoint x="230" y="400" />
+        <bpmndi:BPMNLabel><dc:Bounds x="1906" y="431" width="20" height="14" /></bpmndi:BPMNLabel>
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Flow_Task_Send_19_di" bpmnElement="Flow_Task_Send_19">
+        <di:waypoint x="1030" y="342" />
+        <di:waypoint x="1030" y="218" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Send_NoteWaits_link_di" bpmnElement="Send_NoteWaits_link">
+        <di:waypoint x="479" y="384" />
+        <di:waypoint x="520" y="186" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Send_NoteFirst_link_di" bpmnElement="Send_NoteFirst_link">
+        <di:waypoint x="750" y="411" />
+        <di:waypoint x="710" y="480" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Send_NoteRaise_link_di" bpmnElement="Send_NoteRaise_link">
+        <di:waypoint x="1250" y="411" />
+        <di:waypoint x="1215" y="490" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Send_NoteLeave_link_di" bpmnElement="Send_NoteLeave_link">
+        <di:waypoint x="1055" y="800" />
+        <di:waypoint x="1110" y="825" />
+      </bpmndi:BPMNEdge>
+      <bpmndi:BPMNEdge id="Send_NoteFailed_link_di" bpmnElement="Send_NoteFailed_link">
+        <di:waypoint x="1500" y="620" />
+        <di:waypoint x="1500" y="655" />
+      </bpmndi:BPMNEdge>
+    </bpmndi:BPMNPlane>
+  </bpmndi:BPMNDiagram>
+</bpmn:definitions>
